@@ -8,5 +8,6 @@ exec .venv/bin/celery \
   --beat \
   --loglevel=info \
   --concurrency=1 \
+  --pool=solo \
   -n worker@%h \
   --schedule=run/celerybeat-schedule
