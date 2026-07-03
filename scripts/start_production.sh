@@ -4,8 +4,8 @@ set -e
 echo "Running database migrations..."
 .venv/bin/alembic upgrade head
 
-echo "Creating runtime directories..."
-mkdir -p run
-
-echo "Starting API + worker (honcho)..."
-exec .venv/bin/honcho start -f Procfile.prod
+echo "Starting API server..."
+exec .venv/bin/uvicorn app.main:app \
+  --host 0.0.0.0 \
+  --port "${PORT:-8000}" \
+  --no-access-log
