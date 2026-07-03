@@ -1,7 +1,6 @@
 import asyncio
 from pathlib import Path
 
-from celery import chord, group
 from fastapi import APIRouter, Depends, File, Form, Query, Request, UploadFile, status
 from fastapi.responses import FileResponse, Response
 
@@ -32,7 +31,7 @@ from app.modules.runs.schemas import (
 )
 from app.modules.results import service as results_service
 from app.modules.tenants.models import TenantMembership
-from app.tasks.compute_tasks import ead_ecl_task, lgd_task, pd_task
+from app.tasks.compute_tasks import lgd_task, pd_task
 
 _log = get_logger("runs.router")
 
@@ -195,17 +194,16 @@ async def execute_run_endpoint(
     if data.dispatch_task:
         _log.info("run_queued_dispatching_to_celery", run_id=run_id)
         try:
-            await asyncio.to_thread(
-                lambda: chord(group(pd_task.s(run_id), lgd_task.s(run_id)))(ead_ecl_task.s(run_id))
-            )
+            await asyncio.to_thread(lambda: pd_task.delay(run_id))
+            await asyncio.to_thread(lambda: lgd_task.delay(run_id))
             _log.info(
-                "compute_chord_dispatched",
+                "compute_tasks_dispatched",
                 run_id=run_id,
-                tasks=["pd_task", "lgd_task", "ead_ecl_task"],
+                tasks=["pd_task", "lgd_task"],
                 broker="redis",
             )
         except Exception as exc:
-            _log.error("compute_chord_dispatch_failed", run_id=run_id, exc_info=exc)
+            _log.error("compute_dispatch_failed", run_id=run_id, exc_info=exc)
             await service.revert_run_after_dispatch_failure(db, tenant_id, run_id)
             await db.commit()
             raise ECLException(

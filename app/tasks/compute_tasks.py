@@ -12,7 +12,6 @@ from typing import Any
 from uuid import uuid4
 
 import pandas as pd
-from celery import chord, group
 from sqlalchemy import select, text, update
 from sqlalchemy.ext.asyncio import AsyncSession, async_sessionmaker, create_async_engine
 from sqlalchemy.pool import NullPool
@@ -397,6 +396,51 @@ async def _is_stage_complete(db, run_id: str, stage: str) -> bool:
     return progress.get(stage, {}).get("status") == "complete"
 
 
+async def _try_dispatch_ead(db, run_id: str) -> bool:
+    """Dispatch ead_ecl_task if and only if both PD and LGD stages are complete.
+
+    Uses a single atomic SQL UPDATE to claim the dispatch slot — only the first
+    caller wins. This replaces the Celery chord Redis counter, which is lost
+    when the worker process is killed mid-task.
+
+    Returns True if ead_ecl_task was dispatched, False if the other stage is not
+    yet complete or ead was already dispatched by the parallel task.
+    """
+    if not (await _is_stage_complete(db, run_id, "pd") and await _is_stage_complete(db, run_id, "lgd")):
+        return False
+
+    # Atomically set ead.status = 'queued' only if it is still 'pending'.
+    # The UPDATE affects exactly one row when this caller wins the race;
+    # zero rows when the parallel task already claimed the slot.
+    result = await db.execute(
+        text(
+            """
+            UPDATE runs
+            SET engine_progress = jsonb_set(
+                COALESCE(engine_progress::jsonb, '{}'::jsonb),
+                '{ead}',
+                '{"status": "queued", "started_at": null, "finished_at": null, "elapsed_ms": null}'::jsonb
+            )::json
+            WHERE id = :run_id
+              AND (
+                engine_progress IS NULL
+                OR engine_progress::jsonb -> 'ead' IS NULL
+                OR engine_progress::jsonb -> 'ead' ->> 'status' = 'pending'
+              )
+            """
+        ),
+        {"run_id": run_id},
+    )
+    await db.commit()
+
+    if result.rowcount == 0:
+        return False  # parallel task already dispatched ead_ecl_task
+
+    ead_ecl_task.delay(run_id)
+    _log.info("ead_ecl_task_dispatched", run_id=run_id)
+    return True
+
+
 async def _pd_main(run_id: str) -> dict[str, str]:
     """PD stage — runs in the calling event loop."""
     from app.core.run_enums import RunStatus, UploadKind
@@ -463,6 +507,7 @@ async def _pd_main(run_id: str) -> dict[str, str]:
                 elapsed_ms=progress.get("pd", {}).get("elapsed_ms"),
                 pct=100,
             )
+            await _try_dispatch_ead(db, run_id)
             return {"run_id": run_id, "stage": "pd"}
         except Exception as exc:
             _log.error("compute_stage_failed", run_id=run_id, stage="pd", exc_info=exc)
@@ -528,6 +573,7 @@ async def _lgd_main(run_id: str) -> dict[str, str]:
                 elapsed_ms=progress.get("lgd", {}).get("elapsed_ms"),
                 pct=100,
             )
+            await _try_dispatch_ead(db, run_id)
             return {"run_id": run_id, "stage": "lgd"}
         except Exception as exc:
             _log.error("compute_stage_failed", run_id=run_id, stage="lgd", exc_info=exc)
@@ -813,7 +859,7 @@ def lgd_task(self, run_id: str) -> dict[str, str]:  # type: ignore[misc]
 
 
 @celery_app.task(name="ead_ecl_task", bind=True)
-def ead_ecl_task(self, _group_results: list[Any], run_id: str) -> dict[str, str]:  # type: ignore[misc]
+def ead_ecl_task(self, run_id: str) -> dict[str, str]:  # type: ignore[misc]
     _log.info("task_received", run_id=run_id, stage="ead")
     async def _with_prepare():
         await _prepare_task()
@@ -827,14 +873,6 @@ def ead_ecl_task(self, _group_results: list[Any], run_id: str) -> dict[str, str]
         except Exception:
             pass
         raise
-
-
-@celery_app.task(name="enqueue_compute_pipeline")
-def enqueue_compute_pipeline(run_id: str) -> None:
-    """Enqueue the PD/LGD parallel chord followed by EAD/ECL."""
-    header = group(pd_task.s(run_id), lgd_task.s(run_id))
-    callback = ead_ecl_task.s(run_id)
-    chord(header)(callback)
 
 
 # ---------------------------------------------------------------------------
