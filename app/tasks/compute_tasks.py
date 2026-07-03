@@ -429,6 +429,8 @@ async def _pd_main(run_id: str) -> dict[str, str]:
 
             _log.info("pd_combining_sheets", run_id=run_id, pct=30)
             pd_input = _combine_excel_bytes(files)
+            del files
+            gc.collect()
             _log.info("pd_data_combined", run_id=run_id, row_count=len(pd_input), columns=list(pd_input.columns), pct=35)
 
             _log.info("pd_computing_transition_matrices", run_id=run_id, pct=40)
@@ -501,6 +503,8 @@ async def _lgd_main(run_id: str) -> dict[str, str]:
 
             _log.info("lgd_combining_sheets", run_id=run_id, pct=35)
             lgd_input = _combine_excel_bytes(files)
+            del files
+            gc.collect()
             _log.info("lgd_data_combined", run_id=run_id, row_count=len(lgd_input), pct=40)
 
             _log.info("lgd_computing_discounted_collateral", run_id=run_id, loan_count=len(lgd_input), pct=45)
