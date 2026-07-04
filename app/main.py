@@ -54,34 +54,12 @@ async def lifespan(_app: FastAPI) -> AsyncIterator[None]:
     except Exception as exc:
         storage_status = f"error: {exc}"
 
-    smtp_status: str = "ok"
-    # Skip SMTP connectivity check in production — Render blocks outbound port 587.
-    # Email sending is suppressed via SUPPRESS_EMAIL_SEND env var in production.
-    if settings.smtp_username and not settings.is_production:
-        import asyncio
-        import smtplib
+    email_status: str = "ok"
+    if not settings.resend_api_key and not settings.suppress_email_send:
+        email_status = "misconfigured: RESEND_API_KEY is not set"
+        log.warning("email_startup_check_failed", reason="RESEND_API_KEY not set")
 
-        def _check_smtp() -> None:
-            with smtplib.SMTP(settings.smtp_host, settings.smtp_port, timeout=5) as s:
-                s.ehlo()
-                s.starttls()
-                s.ehlo()
-                s.login(settings.smtp_username, settings.smtp_password)
-
-        try:
-            loop = asyncio.get_event_loop()
-            await loop.run_in_executor(None, _check_smtp)
-        except Exception as exc:
-            smtp_status = f"error: {exc}"
-            log.error(
-                "email_startup_check_failed",
-                smtp_host=settings.smtp_host,
-                smtp_port=settings.smtp_port,
-                smtp_username=settings.smtp_username,
-                exc=str(exc),
-            )
-
-    _app.state.smtp_status = smtp_status
+    _app.state.smtp_status = email_status
 
     log.info(
         "server_startup",
@@ -90,7 +68,7 @@ async def lifespan(_app: FastAPI) -> AsyncIterator[None]:
         db=db_status,
         redis=redis_status,
         storage=storage_status,
-        smtp=smtp_status,
+        smtp=email_status,
         routes=len(_app.routes),
         log_format=settings.log_format,
         log_level=settings.log_level,
