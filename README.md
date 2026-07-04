@@ -61,6 +61,24 @@ docker compose -f docker/docker-compose.test.yml up -d
 make test
 ```
 
+## Production Docker (Render)
+
+The backend deploys as a **single Docker container** on Render running both the FastAPI API and Celery worker/beat via supervisord. The frontend (ECL-Web) deploys separately on Vercel and connects to this backend.
+
+Full deployment guide: [DOCKER_IMPLEMENTATION.md](DOCKER_IMPLEMENTATION.md)
+
+**Quick local Docker test:**
+
+```bash
+docker build -f docker/Dockerfile -t ecl-server:local .
+docker run --rm -p 8000:8000 -e PORT=8000 --env-file .env ecl-server:local
+curl http://localhost:8000/ready
+```
+
+**Render settings:** Runtime = Docker, Dockerfile Path = `docker/Dockerfile`, Docker Context = `.`, Health Check = `/ready`. Leave Build Command and Start Command blank.
+
+Native Render scripts (`scripts/start_production.sh`, `scripts/start_worker.sh`) are for the legacy Native Python runtime only — not used when deploying via Docker.
+
 ## Frontend contract
 
 Read-only reference: `../ECL-Web/`. Full spec: `ECL_AUTH_BACKEND_PROMPT.md`.

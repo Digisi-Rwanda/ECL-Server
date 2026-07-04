@@ -194,8 +194,10 @@ async def execute_run_endpoint(
     if data.dispatch_task:
         _log.info("run_queued_dispatching_to_celery", run_id=run_id)
         try:
-            await asyncio.to_thread(lambda: pd_task.delay(run_id))
-            await asyncio.to_thread(lambda: lgd_task.delay(run_id))
+            await asyncio.gather(
+                asyncio.to_thread(lambda: pd_task.delay(run_id)),
+                asyncio.to_thread(lambda: lgd_task.delay(run_id)),
+            )
             _log.info(
                 "compute_tasks_dispatched",
                 run_id=run_id,
