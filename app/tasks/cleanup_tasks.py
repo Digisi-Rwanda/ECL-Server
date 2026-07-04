@@ -1,10 +1,38 @@
 import asyncio
+from contextlib import asynccontextmanager
+from typing import AsyncGenerator
+
+from sqlalchemy.ext.asyncio import AsyncSession, create_async_engine
+from sqlalchemy.pool import NullPool
 
 from app.tasks.celery_app import celery_app
 
 
 def _run(coro):  # type: ignore[no-untyped-def]
     return asyncio.run(coro)
+
+
+@asynccontextmanager
+async def _task_db() -> AsyncGenerator[AsyncSession, None]:
+    """NullPool session for Celery cleanup tasks.
+
+    Each asyncio.run() call creates a new event loop. The shared AsyncSessionLocal
+    uses a pooled engine whose connections are bound to the loop that created them.
+    Reusing those connections in a different loop raises:
+        RuntimeError: Future attached to a different loop
+    NullPool avoids this entirely — it creates a fresh connection per use and
+    closes it immediately after, so there is never a stale loop-bound connection.
+    """
+    from app.database import _prepare_async_url
+    from app.config import get_settings
+
+    url, connect_args = _prepare_async_url(get_settings().database_url)
+    engine = create_async_engine(url, poolclass=NullPool, connect_args=connect_args)
+    try:
+        async with AsyncSession(engine) as session:
+            yield session
+    finally:
+        await engine.dispose()
 
 
 @celery_app.task(name="expire_invitations")
@@ -15,10 +43,9 @@ def expire_invitations() -> int:
         from sqlalchemy import update
 
         from app.core.enums import InvitationStatus
-        from app.database import AsyncSessionLocal
         from app.modules.invites.models import Invitation
 
-        async with AsyncSessionLocal() as db:
+        async with _task_db() as db:
             result = await db.execute(
                 update(Invitation)
                 .where(
@@ -40,10 +67,9 @@ def expire_password_reset_tokens() -> int:
 
         from sqlalchemy import delete
 
-        from app.database import AsyncSessionLocal
         from app.modules.auth.models import PasswordResetToken
 
-        async with AsyncSessionLocal() as db:
+        async with _task_db() as db:
             result = await db.execute(
                 delete(PasswordResetToken).where(
                     PasswordResetToken.expires_at < datetime.now(UTC),
@@ -63,11 +89,10 @@ def purge_revoked_refresh_tokens() -> int:
 
         from sqlalchemy import delete
 
-        from app.database import AsyncSessionLocal
         from app.modules.sessions.models import RefreshToken
 
         cutoff = datetime.now(UTC) - timedelta(days=30)
-        async with AsyncSessionLocal() as db:
+        async with _task_db() as db:
             result = await db.execute(
                 delete(RefreshToken).where(
                     RefreshToken.is_revoked.is_(True),
@@ -87,11 +112,10 @@ def purge_old_sessions() -> int:
 
         from sqlalchemy import delete
 
-        from app.database import AsyncSessionLocal
         from app.modules.sessions.models import Session
 
         cutoff = datetime.now(UTC) - timedelta(days=90)
-        async with AsyncSessionLocal() as db:
+        async with _task_db() as db:
             result = await db.execute(
                 delete(Session).where(Session.last_active_at < cutoff)
             )
@@ -108,10 +132,9 @@ def purge_expired_token_blacklist() -> int:
 
         from sqlalchemy import delete
 
-        from app.database import AsyncSessionLocal
         from app.modules.auth.models import TokenBlacklist
 
-        async with AsyncSessionLocal() as db:
+        async with _task_db() as db:
             result = await db.execute(
                 delete(TokenBlacklist).where(
                     TokenBlacklist.expires_at < datetime.now(UTC)
@@ -134,10 +157,9 @@ def recover_stuck_runs() -> dict:  # type: ignore[type-arg]
     async def _run_async() -> dict:  # type: ignore[type-arg]
         from datetime import UTC, datetime, timedelta
 
-        from sqlalchemy import select, update
+        from sqlalchemy import update
 
         from app.core.logging import get_logger
-        from app.database import AsyncSessionLocal
         from app.modules.runs.models import Run
 
         log = get_logger("cleanup.stuck_runs")
@@ -148,7 +170,7 @@ def recover_stuck_runs() -> dict:  # type: ignore[type-arg]
         stuck_queued_msg = "Compute job was not picked up by a worker within the timeout window. Ensure the Celery worker is running and try again."
         stuck_running_msg = "Compute stage exceeded the maximum allowed runtime and was forcibly stopped. Please re-run."
 
-        async with AsyncSessionLocal() as db:
+        async with _task_db() as db:
             # Runs stuck in queued
             queued_result = await db.execute(
                 update(Run)
