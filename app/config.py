@@ -50,13 +50,9 @@ class Settings(BaseSettings):
 
     cors_origins: str = "http://localhost:3000"
 
-    smtp_host: str = "localhost"
-    smtp_port: int = 587
-    smtp_username: str = ""
-    smtp_password: str = ""
     smtp_from_email: str = "noreply@eclplatform.com"
     smtp_from_name: str = "ECL Platform"
-    smtp_tls: bool = True
+    resend_api_key: str = ""
     demo_notification_email: str = ""  # if empty, falls back to smtp_from_email
 
     frontend_url: str = "http://localhost:3000"
@@ -136,11 +132,15 @@ class Settings(BaseSettings):
             "redis_celery_url": self.redis_celery_url,
             "cors_origins": self.cors_origins,
             "frontend_url": self.frontend_url,
-            "smtp_host": self.smtp_host,
             "storage_endpoint_url": self.storage_endpoint_url,
         }
 
         errors: list[str] = []
+        if not self.resend_api_key and not self.suppress_email_send:
+            errors.append(
+                "resend_api_key is not set and SUPPRESS_EMAIL_SEND is false; "
+                "emails will fail to deliver in production."
+            )
         for field_name, dev_value in insecure_defaults.items():
             if getattr(self, field_name) == dev_value:
                 errors.append(
