@@ -1,5 +1,6 @@
-"""Email client — Jinja2 rendering + fastapi-mail SMTP delivery."""
+"""Email client — Jinja2 rendering + Resend API delivery."""
 
+import asyncio
 from pathlib import Path
 
 from jinja2 import Environment, FileSystemLoader
@@ -18,41 +19,22 @@ def render_template(name: str, **context: object) -> str:
 
 
 async def send_email(to: str, subject: str, template_name: str, context: dict) -> None:  # type: ignore[type-arg]
-    """Send an HTML email via SMTP using fastapi-mail.
+    """Send an HTML email via Resend API.
 
     Set SUPPRESS_EMAIL_SEND=true in tests to skip actual delivery.
     """
-    from fastapi_mail import ConnectionConfig, FastMail, MessageSchema, MessageType
+    import resend
 
     from app.config import get_settings
 
     s = get_settings()
-
-    use_starttls = s.smtp_port == 587 and s.smtp_tls
-    use_ssl = s.smtp_port == 465
 
     _log.info(
         "email_send_start",
         recipient=to,
         subject=subject,
         template=template_name,
-        smtp_host=s.smtp_host,
-        smtp_port=s.smtp_port,
         suppress_send=s.suppress_email_send,
-    )
-
-    conf = ConnectionConfig(
-        MAIL_USERNAME=s.smtp_username,
-        MAIL_PASSWORD=s.smtp_password,
-        MAIL_FROM=s.smtp_from_email,
-        MAIL_FROM_NAME=s.smtp_from_name,
-        MAIL_PORT=s.smtp_port,
-        MAIL_SERVER=s.smtp_host,
-        MAIL_STARTTLS=use_starttls,
-        MAIL_SSL_TLS=use_ssl,
-        USE_CREDENTIALS=bool(s.smtp_username),
-        VALIDATE_CERTS=True,
-        SUPPRESS_SEND=s.suppress_email_send,
     )
 
     if s.suppress_email_send:
@@ -62,6 +44,7 @@ async def send_email(to: str, subject: str, template_name: str, context: dict) -
             template=template_name,
             reason="SUPPRESS_EMAIL_SEND=true",
         )
+        return
 
     try:
         html = render_template(template_name, **context)
@@ -75,24 +58,22 @@ async def send_email(to: str, subject: str, template_name: str, context: dict) -
         )
         raise
 
-    msg = MessageSchema(
-        subject=subject,
-        recipients=[to],
-        body=html,
-        subtype=MessageType.html,
-    )
-    fm = FastMail(conf)
+    resend.api_key = s.resend_api_key
+    params: resend.Emails.SendParams = {
+        "from": f"{s.smtp_from_name} <{s.smtp_from_email}>",
+        "to": [to],
+        "subject": subject,
+        "html": html,
+    }
 
     try:
-        await fm.send_message(msg)
+        result = await asyncio.to_thread(resend.Emails.send, params)
     except Exception as exc:
         _log.error(
-            "email_smtp_failed",
+            "email_send_failed",
             recipient=to,
             subject=subject,
             template=template_name,
-            smtp_host=s.smtp_host,
-            smtp_port=s.smtp_port,
             exc=str(exc),
             exc_info=True,
         )
@@ -103,5 +84,5 @@ async def send_email(to: str, subject: str, template_name: str, context: dict) -
         recipient=to,
         subject=subject,
         template=template_name,
-        smtp_host=s.smtp_host,
+        resend_id=getattr(result, "id", None),
     )
