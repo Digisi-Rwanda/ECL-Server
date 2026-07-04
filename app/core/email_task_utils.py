@@ -2,7 +2,6 @@
 
 from __future__ import annotations
 
-import smtplib
 from typing import TYPE_CHECKING, Any
 
 from jinja2 import TemplateError
@@ -11,19 +10,36 @@ if TYPE_CHECKING:
     from celery.app.task import Task
 
 
+def _http_status(exc: BaseException) -> int | None:
+    """Extract an HTTP status code from an exception that carries one."""
+    code = getattr(exc, "status_code", None)
+    return code if isinstance(code, int) else None
+
+
 def is_transient_email_error(exc: BaseException) -> bool:
-    if isinstance(exc, (TimeoutError, ConnectionError, OSError, smtplib.SMTPServerDisconnected)):
+    if isinstance(exc, (TimeoutError, ConnectionError, OSError)):
+        return True
+    code = _http_status(exc)
+    # 429 = rate limit; 5xx = Resend server-side error — both are worth retrying
+    if code is not None and (code == 429 or code >= 500):
         return True
     cause = exc.__cause__
-    transient = (TimeoutError, ConnectionError, OSError, smtplib.SMTPServerDisconnected)
-    return isinstance(cause, transient)
+    if cause is not None:
+        if isinstance(cause, (TimeoutError, ConnectionError, OSError)):
+            return True
+        c = _http_status(cause)
+        if c is not None and (c == 429 or c >= 500):
+            return True
+    return False
 
 
 def is_auth_email_error(exc: BaseException) -> bool:
-    if isinstance(exc, (smtplib.SMTPAuthenticationError, smtplib.SMTPNotSupportedError)):
+    # 401 = invalid API key; 403 = unverified sending domain
+    code = _http_status(exc)
+    if code in (401, 403):
         return True
     cause = exc.__cause__
-    return isinstance(cause, (smtplib.SMTPAuthenticationError, smtplib.SMTPNotSupportedError))
+    return cause is not None and _http_status(cause) in (401, 403)
 
 
 def handle_email_task_exception(
