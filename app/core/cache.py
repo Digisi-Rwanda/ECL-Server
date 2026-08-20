@@ -41,7 +41,15 @@ async def blacklist_token(
     from app.modules.auth.models import TokenBlacklist
 
     ttl = max(1, int((expires_at - datetime.now(UTC)).total_seconds()))
-    await redis.setex(f"blacklist:jti:{jti}", ttl, reason)
+    try:
+        await redis.setex(f"blacklist:jti:{jti}", ttl, reason)
+    except Exception:
+        # Redis unavailable: still write the PostgreSQL row below so the
+        # blacklist entry isn't lost — is_token_blacklisted() falls back to
+        # the DB when Redis can't be reached.
+        from app.core.logging import get_logger
+
+        get_logger("app.cache").warning("blacklist_token_redis_unavailable", jti=jti)
 
     entry = TokenBlacklist(jti=jti, user_id=user_id, expires_at=expires_at, reason=reason)
     db.add(entry)

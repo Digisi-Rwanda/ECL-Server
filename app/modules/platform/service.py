@@ -508,9 +508,12 @@ async def end_impersonation(
 
 async def get_system_health(db: AsyncSession) -> SystemHealthOut:
     redis = await get_redis_client()
-    cached = await redis.get("platform:health:v1")
-    if cached:
-        return SystemHealthOut.model_validate_json(cached)
+    try:
+        cached = await redis.get("platform:health:v1")
+        if cached:
+            return SystemHealthOut.model_validate_json(cached)
+    except Exception:
+        pass  # cache unavailable — fall through and compute fresh
 
     settings = get_settings()
     services: list[ServiceStatus] = []
@@ -600,7 +603,10 @@ async def get_system_health(db: AsyncSession) -> SystemHealthOut:
         overall_state=overall,
         recent_errors=recent_errors,
     )
-    await redis.setex("platform:health:v1", 30, result.model_dump_json())
+    try:
+        await redis.setex("platform:health:v1", 30, result.model_dump_json())
+    except Exception:
+        pass  # cache unavailable — the endpoint still returns freshly computed data
     return result
 
 

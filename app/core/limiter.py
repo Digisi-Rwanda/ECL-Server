@@ -28,4 +28,10 @@ limiter = Limiter(
     key_func=get_remote_address,
     enabled=_settings.rate_limit_enabled,
     storage_uri=_storage_uri(),
+    # If the Redis-backed storage is unreachable at request time (e.g. an
+    # Upstash outage), fail open instead of 500ing every rate-limited route.
+    # Rate limiting is a defense-in-depth control, not core functionality —
+    # losing it temporarily during an infra outage is preferable to losing
+    # login/logout/etc. entirely.
+    swallow_errors=True,
 )

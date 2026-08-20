@@ -290,7 +290,14 @@ async def enroll_totp_start(db: AsyncSession, redis: Redis, user: User) -> TOTPE
     img.save(buf, "PNG")
     b64 = base64.b64encode(buf.getvalue()).decode()
 
-    await redis.setex(f"totp:pending:{user.id}", 300, secret)
+    try:
+        await redis.setex(f"totp:pending:{user.id}", 300, secret)
+    except Exception as exc:
+        raise ECLException(
+            "TOTP_SERVICE_UNAVAILABLE",
+            "MFA enrollment is temporarily unavailable. Please try again shortly.",
+            503,
+        ) from exc
 
     return TOTPEnrollResponse(
         qr_code_uri=uri,
@@ -306,7 +313,14 @@ async def enroll_totp_confirm(
 
     from app.core.security import encrypt_totp_secret, generate_backup_codes
 
-    raw_secret = await redis.get(f"totp:pending:{user.id}")
+    try:
+        raw_secret = await redis.get(f"totp:pending:{user.id}")
+    except Exception as exc:
+        raise ECLException(
+            "TOTP_SERVICE_UNAVAILABLE",
+            "MFA enrollment is temporarily unavailable. Please try again shortly.",
+            503,
+        ) from exc
     if not raw_secret:
         raise ECLException("TOTP_ENROLLMENT_EXPIRED", "Enrollment session expired.", 400)
 
@@ -319,7 +333,10 @@ async def enroll_totp_confirm(
     user.totp_enabled = True
     user.totp_backup_codes = hashed_codes
 
-    await redis.delete(f"totp:pending:{user.id}")
+    try:
+        await redis.delete(f"totp:pending:{user.id}")
+    except Exception:
+        pass  # best-effort cleanup; the pending key will simply expire via its TTL
 
     from app.modules.audit.models import AuditEvent
     from app.modules.audit.service import log_event
