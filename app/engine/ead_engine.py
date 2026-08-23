@@ -16,6 +16,13 @@ _LGD_SUM_COL = "Sum of Discounted Collaterals per Loan ID"
 _LGD_SUM_SHORT = "Sum of Discounted Collaterals"
 _MISSED_EPS = 1e-9
 
+# ECL formula context: Expected Credit Loss = EAD x PD x LGD, discounted to
+# present value. This module derives EAD (via loan-balance amortization),
+# combines it with PD (from pd_engine.py) and collateral (from
+# lgd_engine.py) to get LGD, and computes the final Credit Loss /
+# Discounted ECL. See compute_ead() below, particularly the "Credit Loss"
+# and "Discounted ECL" lines, for the core formula.
+
 
 def _resolve_column(df: pd.DataFrame, names: tuple[str, ...], default: str) -> str:
     for name in names:
@@ -29,6 +36,8 @@ def _to_decimal(value: float | int | Decimal) -> Decimal:
 
 
 def _months_between(start: date | pd.Timestamp, end: date | pd.Timestamp) -> int:
+    # Math: months = (end.year - start.year) x 12 + (end.month - start.month)
+    # Whole-calendar-month difference between two dates (ignores day-of-month).
     start_ts = pd.Timestamp(start)
     end_ts = pd.Timestamp(end)
     return (end_ts.year - start_ts.year) * 12 + (end_ts.month - start_ts.month)
@@ -46,6 +55,11 @@ def _period_instalment(
     For QTR: quarterly rate = eir/4, periods = remaining_months // 3.
     Monthly accrual in the balance walk always uses eir/12 regardless of freq.
     """
+    # Math: PMT = P x r / (1 - (1 + r)^(-n))
+    #   P = outstanding principal, r = rate per period, n = periods remaining
+    #   (PMT = P / n when r == 0)
+    # The standard fixed-instalment loan amortization payment formula --
+    # the same arithmetic behind any mortgage/loan calculator.
     if freq == "QTR":
         periods = max(1, remaining_months // 3)
         period_rate = eir / 4.0
@@ -75,6 +89,10 @@ def _count_missed_periods(
     For QTR: payments fall on rows where (row_idx+1) % 3 == 0 — look back at
     the last 3 prior payment rows.
     """
+    # Math: for each of the last 3 payment checkpoints i,
+    #   flag "missed" if Opening_i x (1 + monthly_rate) < instalment
+    # This is a proxy built from the projected balance trajectory itself,
+    # not from an actual payment-received/not-received record in the data.
     if instalment <= 0:
         return 0
 
@@ -117,6 +135,7 @@ def _walk_loan_balances(group: pd.DataFrame) -> pd.DataFrame:
         is_payment_month = (freq != "QTR") or ((row_idx + 1) % 3 == 0)
         effective_instalment = instalment if is_payment_month else 0.0
 
+        # Math: BalanceAfterRepayment_t = max(0, Opening_t x (1+r) - PMT_t)
         after_repayment = opening * (1.0 + monthly_rate) - effective_instalment
         if after_repayment < 0:
             after_repayment = 0.0
@@ -125,6 +144,9 @@ def _walk_loan_balances(group: pd.DataFrame) -> pd.DataFrame:
         missed_count = _count_missed_periods(
             row_idx, opening_balances, monthly_rate, instalment, freq
         )
+        # Math: EAD_t = BalanceAfterRepayment_t x (1+r)^(MissedCount_t)
+        # Extra interest compounded on top for recently-missed instalments;
+        # this final value is the model's Exposure at Default for period t.
         after_missed = after_repayment * ((1.0 + monthly_rate) ** missed_count)
         balances_after_missed.append(after_missed)
 
@@ -142,6 +164,10 @@ def _expand_snapshots(merged: pd.DataFrame) -> pd.DataFrame:
     Stage 2 → 1 snapshot per month from reporting date to maturity.
     Unknown staging → treated as Stage 3 (single snapshot).
     """
+    # Rule (not a formula): IFRS9 requires a 12-month loss horizon for
+    # Stage 1 (performing) loans, and a lifetime (to-maturity) horizon for
+    # Stage 2/3 loans. This determines how many future snapshot months get
+    # a Credit Loss / Discounted ECL computed further down in compute_ead().
     rep_dates = pd.to_datetime(merged["Reporting Date"])
     mat_dates = pd.to_datetime(merged["Maturity Date"])
     merged = merged.copy()
@@ -288,8 +314,11 @@ def compute_ead(
     snapshots["Snapshot Date"] = pd.to_datetime(snapshots["Snapshot Date"])
 
     # Step 3 — period since origination.
+    # +1 matches PD.ipynb's calculate_period_since_origination(): a loan
+    # snapshotted in its origination month (0 calendar months elapsed) is
+    # treated as "month 1" to align with PD's 1-indexed Month column.
     snapshots["Period Since Origination"] = [
-        _months_between(first_payment, snapshot)
+        _months_between(first_payment, snapshot) + 1
         for first_payment, snapshot in zip(
             snapshots["First Payment Date"],
             snapshots["Snapshot Date"],
@@ -369,6 +398,9 @@ def compute_ead(
     bal_after_missed = snapshots["Balance After Missed Payment"].astype(float)
     collateral = snapshots[_LGD_SUM_SHORT].astype(float)
 
+    # Math: LGW_t = max(1 - Collateral / EAD_t, 0)   [0 when EAD_t <= 0]
+    # Raw loss rate before accounting for the chance of curing: 100% minus
+    # however much of the balance the discounted collateral would cover.
     lgw = np.where(
         bal_after_missed <= 0,
         0.0,
@@ -377,18 +409,38 @@ def compute_ead(
     snapshots["LGW"] = lgw
 
     cure_rate = snapshots["Cure_Rate"].astype(float)
-    snapshots["LGD"] = snapshots["LGW"] * (1.0 - cure_rate)
+    # Math: LGD_t = max(0, LGW_t x (1 - CureRate))
+    snapshots["LGD"] = np.maximum(0.0, snapshots["LGW"] * (1.0 - cure_rate))
 
     marginal_pd = snapshots["Marginal_PD"].astype(float)
+    # Math: CreditLoss_t = EAD_t x PD_t x LGD_t
+    # The core IFRS9 Expected Credit Loss formula for one loan, one period:
+    # Expected Loss = Exposure at Default x Probability of Default x Loss
+    # Given Default. Everything computed above in this module and in
+    # pd_engine.py / lgd_engine.py exists to produce these three numbers.
     snapshots["Credit Loss"] = bal_after_missed * marginal_pd * snapshots["LGD"].astype(float)
 
     monthly_rate = snapshots["EIR"].astype(float) / 12.0
     period_to_discount = snapshots["Period to be Discounted"].astype(int)
+    # Math: DiscountFactor_t = (1 + r)^(-t)   [r = EIR/12, t = months out]
+    # Stage 3 (already in default) is not discounted at all, matching
+    # PD.ipynb's calculate_discounted_ecl(), which returns raw Credit Loss
+    # for Stage 3 and only discounts Stage 1/2.
+    is_stage_3 = snapshots["Staging"] == "Stage 3"
     discount_factor = np.where(
-        period_to_discount > 0,
-        (1.0 + monthly_rate) ** (-period_to_discount),
+        is_stage_3,
         1.0,
+        np.where(
+            period_to_discount > 0,
+            (1.0 + monthly_rate) ** (-period_to_discount),
+            1.0,
+        ),
     )
+    # Math: DiscountedECL_t = CreditLoss_t x DiscountFactor_t
+    # Present-value discount of the period's expected loss back to today, at
+    # the loan's own effective interest rate. This is the figure that is
+    # actually stored and reported per loan per snapshot period; summed
+    # across a loan's full horizon it gives that loan's Total ECL.
     snapshots["Discounted ECL"] = snapshots["Credit Loss"] * discount_factor
 
     decimal_cols = [
