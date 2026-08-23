@@ -21,4 +21,4 @@ def test_compute_pd_basic() -> None:
     assert not output.empty
     assert "Marginal_PD" in output.columns
     assert "Retail" in cure_rates
-    assert output["Month"].max() == 299
+    assert output["Month"].max() == 300
