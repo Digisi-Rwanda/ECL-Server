@@ -15,7 +15,7 @@ from app.modules.collateral.models import CollateralType  # noqa: F401
 from app.modules.invites.models import Invitation  # noqa: F401
 from app.modules.audit.models import AuditLog  # noqa: F401
 from app.modules.results.models import EadResult, LgdResult, OutputArtifact, PdResult  # noqa: F401
-from app.modules.runs.models import Run, Upload  # noqa: F401
+from app.modules.runs.models import PdValidationThresholds, Run, Upload  # noqa: F401
 from app.modules.segments.models import Segment  # noqa: F401
 from app.modules.sessions.models import RefreshToken, Session  # noqa: F401
 from app.modules.tenants.models import Tenant, TenantMembership  # noqa: F401
