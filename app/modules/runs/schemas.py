@@ -163,6 +163,76 @@ class PresignedDownloadOut(BaseModel):
     expires_at: datetime
 
 
+# ── PD-scoped validation (?scope=pd) ─────────────────────────────────────────
+# These are additive. The unscoped validate path keeps returning
+# ValidationResultOut unchanged.
+
+
+class PdCriterionOut(BaseModel):
+    id: str
+    code: str
+    name: str
+    category: Literal["structural", "business", "info"]
+    outcome: Literal["pass", "review", "block", "info"]
+    rationale: str
+
+
+class PdLoanPreviewOut(BaseModel):
+    loan_id: str
+    segment: str
+    reporting_month: str
+    reporting_month_key: str
+    # 1 | 2 | 3 for an on-book stage, "offbooks" once the loan leaves.
+    staging: int | str
+    next_staging: int | str
+    # True when this is the segment's last reporting month, where "offbooks"
+    # means "no next month in the data" rather than "the loan exited".
+    is_final_month: bool
+
+
+class PdSegmentStatsOut(BaseModel):
+    # Fraction, not a percentage. The client formats it.
+    cure_rate: float
+    loans_observed: int
+    months_of_history: int
+
+
+class PdSegmentPreviewOut(BaseModel):
+    segment: str
+    # Row-normalized 3x4, aligned with dest_labels.
+    matrix: list[list[float]]
+    # Pre-formatted money for each cell — the server owns all formatting.
+    amounts: list[list[str]]
+    dest_labels: list[str]
+    stats: PdSegmentStatsOut
+
+
+class PdPreviewOut(BaseModel):
+    loans: list[PdLoanPreviewOut]
+    segments: list[PdSegmentPreviewOut]
+    engine_version: str
+
+
+class PdValidationIssueOut(BaseModel):
+    id: str
+    level: Literal["warn", "block"]
+    title: str
+    location: str
+    fix: str
+    category: str | None = None
+
+
+class PdValidationResultOut(BaseModel):
+    status: Literal["ok", "warn", "blocking"]
+    criteria: list[PdCriterionOut]
+    pd_preview: PdPreviewOut
+    issues: list[PdValidationIssueOut]
+
+
+class PdValidationResponse(BaseModel):
+    data: PdValidationResultOut
+
+
 class RunResponse(BaseModel):
     data: RunDetailOut
 
