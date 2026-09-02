@@ -54,6 +54,20 @@ from app.core.logging import get_logger
 
 log = get_logger("runs.service")
 
+
+def _compute_has_started(progress: object) -> bool:
+    """True once any engine stage has left pending — used to retry a stuck queue."""
+    if not isinstance(progress, dict):
+        return False
+    for stage in ("pd", "lgd", "ead", "ecl"):
+        status = (progress.get(stage) or {}).get("status")
+        if status in {"running", "complete", "failed"}:
+            return True
+        if stage == "ead" and status == "queued":
+            return True
+    return False
+
+
 _ACTIVE_RUN_STATUSES = frozenset(
     {
         RunStatus.QUEUED.value,
@@ -1160,6 +1174,9 @@ async def execute_run(
     run = await _get_run_for_update(db, tenant_id, run_id)
     log.info("execute_run_current_status", run_id=run_id, status=run.status, engine_version=run.engine_version)
     if run.status in _ACTIVE_RUN_STATUSES:
+        if run.status == RunStatus.QUEUED.value and not _compute_has_started(run.engine_progress):
+            log.info("execute_run_reddispatch_unstarted_queue", run_id=run_id)
+            return ExecuteRunOut(run_id=run_id, status=run.status, dispatch_task=True)
         log.info("execute_run_already_active", run_id=run_id, status=run.status)
         return ExecuteRunOut(run_id=run_id, status=run.status, dispatch_task=False)
     if run.status not in (RunStatus.DRAFT.value, RunStatus.FAILED.value):
