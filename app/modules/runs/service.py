@@ -1268,6 +1268,7 @@ async def get_run(
     run_id: str,
     user: User | None = None,
     membership: TenantMembership | None = None,
+    view: str = "full",
 ) -> RunDetailOut:
     tenant = await _get_tenant(db, tenant_id)
     if user is not None:
@@ -1283,6 +1284,33 @@ async def get_run(
     user = await _get_user(db, run.created_by_user_id)
     base = await _run_list_item(run, user, tenant)
 
+    failure: FailureDetailsOut | None = None
+    if run.failure_stage and run.failure_message:
+        failure = FailureDetailsOut(
+            stage=run.failure_stage,
+            message=run.failure_message,
+            ref=run.failure_ref or "",
+        )
+
+    # Compute-step polling only needs status + engine_progress. The full
+    # payload (audit JSON scan, uploads twice, EAD count) is what made the
+    # terminal look like a compute loop while the worker never started.
+    if view == "progress":
+        return RunDetailOut(
+            **base.model_dump(),
+            elapsed=_format_elapsed(run.started_at, run.finished_at),
+            kpis=_build_kpis(run, None),
+            segments=[],
+            inputFiles=[],
+            auditEvents=[],
+            engineInfo=_engine_info(run),
+            engineProgress=_engine_progress_out(run.engine_progress),
+            failureDetails=failure,
+            deletedBy=None,
+            deletedAt=None,
+            acceptedWarnings=None,
+        )
+
     from app.modules.results.models import EadResult
 
     loan_count_result = await db.execute(
@@ -1297,14 +1325,6 @@ async def get_run(
     if run.deleted_by_user_id:
         deleter = await _get_user(db, run.deleted_by_user_id)
         deleted_by_name = deleter.name
-
-    failure: FailureDetailsOut | None = None
-    if run.failure_stage and run.failure_message:
-        failure = FailureDetailsOut(
-            stage=run.failure_stage,
-            message=run.failure_message,
-            ref=run.failure_ref or "",
-        )
 
     accepted_warnings = sum(1 for u in await _load_uploads(db, run_id) if u.warnings_accepted)
 
