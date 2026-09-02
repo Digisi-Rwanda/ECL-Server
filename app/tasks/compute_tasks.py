@@ -3,6 +3,7 @@
 from __future__ import annotations
 
 import asyncio
+import contextvars
 import gc
 import io
 from collections.abc import Callable
@@ -23,6 +24,12 @@ from app.tasks.celery_app import celery_app
 _log = get_logger(__name__)
 
 STAGE_KEYS = ("pd", "lgd", "ead", "ecl")
+
+# When True, PD/LGD skip Celery EAD dispatch — the inline pipeline runs EAD itself.
+_INLINE_COMPUTE: contextvars.ContextVar[bool] = contextvars.ContextVar(
+    "inline_compute", default=False
+)
+_inline_jobs: set[asyncio.Task[None]] = set()
 
 
 def _run(coro):  # type: ignore[no-untyped-def]
@@ -419,6 +426,9 @@ async def _try_dispatch_ead(db, run_id: str) -> bool:
     Returns True if ead_ecl_task was dispatched, False if the other stage is not
     yet complete or ead was already dispatched by the parallel task.
     """
+    if _INLINE_COMPUTE.get():
+        return False
+
     if not (await _is_stage_complete(db, run_id, "pd") and await _is_stage_complete(db, run_id, "lgd")):
         return False
 
@@ -893,12 +903,39 @@ def ead_ecl_task(self, run_id: str) -> dict[str, str]:  # type: ignore[misc]
 # ---------------------------------------------------------------------------
 
 
+async def celery_workers_available() -> bool:
+    """True when at least one Celery worker answers ping."""
+    try:
+
+        def _ping() -> dict[str, Any] | None:
+            return celery_app.control.inspect(timeout=0.8).ping()
+
+        pong = await asyncio.wait_for(asyncio.to_thread(_ping), timeout=1.6)
+        return bool(pong)
+    except Exception as exc:
+        _log.info("celery_worker_probe_failed", error=str(exc))
+        return False
+
+
+def schedule_inline_compute(run_id: str) -> None:
+    """Start PD → LGD → EAD/ECL in this API process when no worker is listening."""
+    task = asyncio.create_task(
+        run_compute_pipeline_async(run_id),
+        name=f"inline-compute-{run_id}",
+    )
+    _inline_jobs.add(task)
+    task.add_done_callback(_inline_jobs.discard)
+    _log.info("compute_pipeline_scheduled_inline", run_id=run_id)
+
+
 async def run_compute_pipeline_async(run_id: str) -> None:
     """Run the full compute pipeline in the calling event loop.
 
     PD and LGD execute concurrently; EAD/ECL runs after both succeed.
     Stage failures are persisted to the database; this coroutine never raises.
     """
+    token = _INLINE_COMPUTE.set(True)
+    _log.info("compute_pipeline_inline_started", run_id=run_id)
     try:
         results = await asyncio.gather(
             _pd_main(run_id),
@@ -909,5 +946,8 @@ async def run_compute_pipeline_async(run_id: str) -> None:
             _log.warning("compute_pipeline_aborted", run_id=run_id, reason="pd_or_lgd_failed")
             return
         await _ead_ecl_main(run_id)
+        _log.info("compute_pipeline_inline_finished", run_id=run_id)
     except Exception as exc:
         _log.error("compute_pipeline_unhandled_error", run_id=run_id, exc_info=exc)
+    finally:
+        _INLINE_COMPUTE.reset(token)
