@@ -257,8 +257,16 @@ async def get_run_endpoint(
     db: DbSession,
     user: CurrentUser,
     membership: TenantMembership = Depends(require_tenant_member),
+    view: str = Query(default="full"),
 ) -> RunResponse:
-    data = await service.get_run(db, tenant_id, run_id, user=user, membership=membership)
+    data = await service.get_run(
+        db,
+        tenant_id,
+        run_id,
+        user=user,
+        membership=membership,
+        view=view,
+    )
     return RunResponse(data=data)
 
 
