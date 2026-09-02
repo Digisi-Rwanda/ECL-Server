@@ -32,7 +32,12 @@ from app.modules.runs.schemas import (
     ValidationResponse,
 )
 from app.modules.tenants.models import TenantMembership
-from app.tasks.compute_tasks import lgd_task, pd_task
+from app.tasks.compute_tasks import (
+    celery_workers_available,
+    lgd_task,
+    pd_task,
+    schedule_inline_compute,
+)
 
 _log = get_logger("runs.router")
 
@@ -216,27 +221,30 @@ async def execute_run_endpoint(
     )
     await db.commit()
     if data.dispatch_task:
-        _log.info("run_queued_dispatching_to_celery", run_id=run_id)
-        try:
-            await asyncio.gather(
-                asyncio.to_thread(lambda: pd_task.delay(run_id)),
-                asyncio.to_thread(lambda: lgd_task.delay(run_id)),
-            )
-            _log.info(
-                "compute_tasks_dispatched",
-                run_id=run_id,
-                tasks=["pd_task", "lgd_task"],
-                broker="redis",
-            )
-        except Exception as exc:
-            _log.error("compute_dispatch_failed", run_id=run_id, exc_info=exc)
-            await service.revert_run_after_dispatch_failure(db, tenant_id, run_id)
-            await db.commit()
-            raise ECLException(
-                "COMPUTE_DISPATCH_FAILED",
-                "Could not start the computation. Please try again in a moment.",
-                503,
-            ) from exc
+        workers = await celery_workers_available()
+        if workers:
+            _log.info("run_queued_dispatching_to_celery", run_id=run_id)
+            try:
+                await asyncio.gather(
+                    asyncio.to_thread(lambda: pd_task.delay(run_id)),
+                    asyncio.to_thread(lambda: lgd_task.delay(run_id)),
+                )
+                _log.info(
+                    "compute_tasks_dispatched",
+                    run_id=run_id,
+                    tasks=["pd_task", "lgd_task"],
+                    broker="redis",
+                )
+            except Exception as exc:
+                _log.warning(
+                    "compute_dispatch_failed_falling_back_inline",
+                    run_id=run_id,
+                    exc_info=exc,
+                )
+                schedule_inline_compute(run_id)
+        else:
+            _log.info("no_celery_workers_running_inline", run_id=run_id)
+            schedule_inline_compute(run_id)
     else:
         _log.info("execute_run_idempotent_skip_dispatch", run_id=run_id, status=data.status)
     return ExecuteRunResponse(data=data)
