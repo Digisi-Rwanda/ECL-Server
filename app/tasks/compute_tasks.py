@@ -5,6 +5,7 @@ from __future__ import annotations
 import asyncio
 import gc
 import io
+from collections.abc import Callable
 from contextlib import asynccontextmanager
 from datetime import UTC, datetime
 from decimal import Decimal
@@ -228,13 +229,25 @@ async def _download_uploads(uploads) -> list[bytes]:
     return [await download_bytes(upload.storage_path) for upload in uploads]
 
 
-def _combine_excel_bytes(files: list[bytes]) -> pd.DataFrame:
+def _combine_excel_bytes(
+    files: list[bytes],
+    keep_sheet: Callable[[pd.DataFrame], bool] | None = None,
+) -> pd.DataFrame:
+    """Concatenate every non-empty sheet across the given workbooks.
+
+    `keep_sheet` filters out non-data tabs. The PD stage passes the same
+    predicate PD validation uses, so what was validated is what gets computed;
+    without it a cover page or notes tab is concatenated in as all-NaN rows.
+    """
     frames: list[pd.DataFrame] = []
     for data in files:
         sheets = pd.read_excel(io.BytesIO(data), sheet_name=None)
         for sheet_df in sheets.values():
-            if not sheet_df.empty:
-                frames.append(sheet_df)
+            if sheet_df.empty:
+                continue
+            if keep_sheet is not None and not keep_sheet(sheet_df):
+                continue
+            frames.append(sheet_df)
     if not frames:
         return pd.DataFrame()
     return pd.concat(frames, ignore_index=True)
@@ -445,7 +458,7 @@ async def _pd_main(run_id: str) -> dict[str, str]:
     """PD stage — runs in the calling event loop."""
     from app.core.run_enums import RunStatus, UploadKind
     from app.engine.bulk_insert import bulk_insert_pd_results
-    from app.engine.pd_engine import compute_pd
+    from app.engine.pd_engine import compute_pd, is_pd_data_sheet
 
     async with _fresh_session() as (db, task_engine):
         run = await _load_run(db, run_id)
@@ -472,7 +485,7 @@ async def _pd_main(run_id: str) -> dict[str, str]:
             _log.info("pd_files_downloaded", run_id=run_id, file_count=len(files), total_bytes=total_bytes, pct=25)
 
             _log.info("pd_combining_sheets", run_id=run_id, pct=30)
-            pd_input = _combine_excel_bytes(files)
+            pd_input = _combine_excel_bytes(files, keep_sheet=is_pd_data_sheet)
             del files
             gc.collect()
             _log.info("pd_data_combined", run_id=run_id, row_count=len(pd_input), columns=list(pd_input.columns), pct=35)
@@ -589,7 +602,7 @@ async def _ead_ecl_main(run_id: str) -> dict[str, str]:
     from app.engine.ead_engine import compute_ead
     from app.engine.excel_writer import build_ecl_aggregates, generate_all_workbooks
     from app.engine.lgd_engine import compute_lgd
-    from app.engine.pd_engine import compute_pd
+    from app.engine.pd_engine import compute_pd, is_pd_data_sheet
 
     async with _fresh_session() as (db, task_engine):
         run = await _load_run(db, run_id)
@@ -692,7 +705,7 @@ async def _ead_ecl_main(run_id: str) -> dict[str, str]:
             pd_files = await _download_uploads(pd_uploads)
             if not run.combine_pd_files and len(pd_files) > 1:
                 pd_files = pd_files[:1]
-            pd_input = _combine_excel_bytes(pd_files)
+            pd_input = _combine_excel_bytes(pd_files, keep_sheet=is_pd_data_sheet)
             pd_output, cure_rates, intermediates = compute_pd(pd_input)
             _log.info("ecl_pd_recomputed_for_workbooks", run_id=run_id, pd_rows=len(pd_output), pct=85)
 
