@@ -16,10 +16,12 @@ from app.dependencies import (
     require_tenant_analyst_or_admin,
     require_tenant_member,
 )
-from app.modules.runs import service
+from app.modules.results import service as results_service
+from app.modules.runs import pd_validation, service
 from app.modules.runs.schemas import (
     CreateRunRequest,
     ExecuteRunResponse,
+    PdValidationResponse,
     PresignedDownloadResponse,
     RerunRequest,
     RunListResponse,
@@ -29,7 +31,6 @@ from app.modules.runs.schemas import (
     ValidateRunRequest,
     ValidationResponse,
 )
-from app.modules.results import service as results_service
 from app.modules.tenants.models import TenantMembership
 from app.tasks.compute_tasks import lgd_task, pd_task
 
@@ -141,8 +142,31 @@ async def validate_files_endpoint(
     body: ValidateRunRequest,
     db: DbSession,
     user: CurrentUser,
+    scope: str | None = Query(default=None),
     _a: TenantMembership = Depends(require_tenant_analyst_or_admin),
-) -> ValidationResponse:
+) -> ValidationResponse | PdValidationResponse:
+    # ?scope=pd validates the PD uploads alone and returns the criteria
+    # checklist plus preview. Unscoped keeps the original all-three-files
+    # behaviour byte for byte.
+    if scope and scope.strip().lower() == "pd":
+        _log.info("pd_validation_requested", run_id=run_id, tenant_id=tenant_id, user_id=user.id)
+        pd_data = await pd_validation.validate_pd_files(
+            db,
+            tenant_id,
+            run_id,
+            user.id,
+            ip=get_client_ip(request.headers.get("X-Forwarded-For")),
+            user_agent=get_user_agent(request.headers.get("User-Agent")),
+        )
+        _log.info(
+            "pd_validation_complete",
+            run_id=run_id,
+            status=pd_data.status,
+            criteria_count=len(pd_data.criteria),
+            loan_rows=len(pd_data.pd_preview.loans),
+        )
+        return PdValidationResponse(data=pd_data)
+
     _log.info(
         "validation_requested",
         run_id=run_id,
