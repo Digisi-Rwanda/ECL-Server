@@ -240,24 +240,10 @@ def _combine_excel_bytes(
     files: list[bytes],
     keep_sheet: Callable[[pd.DataFrame], bool] | None = None,
 ) -> pd.DataFrame:
-    """Concatenate every non-empty sheet across the given workbooks.
+    """Concatenate kept sheets. Delegates to the shared workbook reader."""
+    from app.engine.workbook import frames_from_workbooks
 
-    `keep_sheet` filters out non-data tabs. The PD stage passes the same
-    predicate PD validation uses, so what was validated is what gets computed;
-    without it a cover page or notes tab is concatenated in as all-NaN rows.
-    """
-    frames: list[pd.DataFrame] = []
-    for data in files:
-        sheets = pd.read_excel(io.BytesIO(data), sheet_name=None)
-        for sheet_df in sheets.values():
-            if sheet_df.empty:
-                continue
-            if keep_sheet is not None and not keep_sheet(sheet_df):
-                continue
-            frames.append(sheet_df)
-    if not frames:
-        return pd.DataFrame()
-    return pd.concat(frames, ignore_index=True)
+    return frames_from_workbooks(files, keep_sheet=keep_sheet)
 
 
 async def _input_hashes(db, run_id: str) -> str:
@@ -502,6 +488,13 @@ async def _pd_main(run_id: str) -> dict[str, str]:
 
             _log.info("pd_computing_transition_matrices", run_id=run_id, pct=40)
             pd_output, _cure_rates, _intermediates = compute_pd(pd_input)
+            from app.modules.results.pd_observation import persist_pd_observation
+
+            preview = _intermediates.get("preview")
+            if preview is not None:
+                await persist_pd_observation(
+                    db, run_id=run.id, tenant_id=run.tenant_id, preview=preview
+                )
             segments = sorted(pd_output["SEGMENT"].unique().tolist()) if "SEGMENT" in pd_output.columns else []
             _log.info(
                 "pd_matrices_computed",
