@@ -1,7 +1,7 @@
 from datetime import date, datetime
 from decimal import Decimal
 
-from sqlalchemy import BigInteger, Date, DateTime, Index, Integer, Numeric, String, Text, func
+from sqlalchemy import BigInteger, Date, DateTime, Index, Integer, JSON, Numeric, String, Text, func
 from sqlalchemy.orm import Mapped, mapped_column
 
 from app.database import Base
@@ -24,6 +24,26 @@ class PdResult(Base):
     s3_prob: Mapped[Decimal] = mapped_column(Numeric(10, 8), nullable=False)
     marginal_pd: Mapped[Decimal] = mapped_column(Numeric(10, 8), nullable=False)
     cure_rate: Mapped[Decimal] = mapped_column(Numeric(10, 8), nullable=False)
+
+
+class PdObservationSnapshot(Base):
+    """Observed PD preview persisted at compute — same payload validation shows.
+
+    Validation is preview-only. Confirm + compute writes this snapshot so the
+    results explorer reads the identical loan rows and 3x4 matrix instead of
+    reconstructing a different 3x3 from pd_results month 1.
+    """
+
+    __tablename__ = "pd_observation_snapshots"
+
+    id: Mapped[str] = mapped_column(String(26), primary_key=True)
+    run_id: Mapped[str] = mapped_column(String(26), nullable=False, unique=True, index=True)
+    tenant_id: Mapped[str] = mapped_column(String(26), nullable=False, index=True)
+    engine_version: Mapped[str] = mapped_column(Text, nullable=False)
+    payload: Mapped[dict] = mapped_column(JSON, nullable=False)
+    created_at: Mapped[datetime] = mapped_column(
+        DateTime(timezone=True), server_default=func.now(), nullable=False
+    )
 
 
 class LgdResult(Base):
