@@ -64,7 +64,13 @@ from app.modules.auth.models import (  # noqa: E402
 )
 from app.modules.collateral.models import CollateralType  # noqa: E402
 from app.modules.invites.models import Invitation  # noqa: E402
-from app.modules.results.models import EadResult, LgdResult, OutputArtifact, PdResult  # noqa: E402
+from app.modules.results.models import (  # noqa: E402
+    EadResult,
+    LgdResult,
+    OutputArtifact,
+    PdObservationSnapshot,
+    PdResult,
+)
 from app.modules.runs.models import PdValidationThresholds, Run, Upload  # noqa: E402
 from app.modules.segments.models import Segment  # noqa: E402
 from app.modules.sessions.models import RefreshToken, Session  # noqa: E402
@@ -84,6 +90,7 @@ _CLEAN_ORDER = [
     EadResult,
     LgdResult,
     PdResult,
+    PdObservationSnapshot,
     OutputArtifact,
     Upload,
     Run,
