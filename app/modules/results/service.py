@@ -7,6 +7,7 @@ from typing import Literal
 from zoneinfo import ZoneInfo
 
 from sqlalchemy import func, select
+from sqlalchemy.exc import ProgrammingError
 from sqlalchemy.ext.asyncio import AsyncSession
 
 from app.core.exceptions import ECLException
@@ -21,6 +22,12 @@ from app.engine.format_utils import (
 from app.modules.auth.models import User
 from app.modules.auth.utils import user_initials
 from app.modules.results.models import EadResult, LgdResult, PdResult
+from app.modules.results.pd_observation import (
+    load_pd_observation,
+    persist_pd_observation_payload,
+    rebuild_pd_observation,
+    segment_from_preview,
+)
 from app.modules.results.schemas import (
     ActiveRunOut,
     DashboardOut,
@@ -34,6 +41,7 @@ from app.modules.results.schemas import (
     RunSummaryOut,
     SegmentBarDashboardOut,
     SegmentDataOut,
+    SegmentRateStatsOut,
     SegmentViewOut,
     StageSliceOut,
     TrendPointOut,
@@ -433,6 +441,32 @@ async def _loan_rows_for_segment(
     return loans, total
 
 
+async def _segment_rate_avgs(
+    db: AsyncSession, run_id: str, tenant_id: str, segment_name: str
+) -> tuple[float | None, float | None]:
+    lgd_result = await db.execute(
+        select(func.avg(EadResult.lgd)).where(
+            EadResult.run_id == run_id,
+            EadResult.tenant_id == tenant_id,
+            EadResult.segment == segment_name,
+        )
+    )
+    pd_result = await db.execute(
+        select(func.avg(EadResult.marginal_pd)).where(
+            EadResult.run_id == run_id,
+            EadResult.tenant_id == tenant_id,
+            EadResult.segment == segment_name,
+            EadResult.period_to_discount <= 12,
+        )
+    )
+    avg_lgd = lgd_result.scalar_one_or_none()
+    avg_pd = pd_result.scalar_one_or_none()
+    return (
+        float(avg_lgd) if avg_lgd is not None else None,
+        float(avg_pd) if avg_pd is not None else None,
+    )
+
+
 async def _pd_matrix(
     db: AsyncSession, run_id: str, tenant_id: str, segment_name: str
 ) -> tuple[tuple[float, float, float], tuple[float, float, float], tuple[float, float, float]]:
@@ -772,9 +806,41 @@ async def get_segment(
     pd_matrix = await _pd_matrix(db, run.id, tenant_id, segment_name)
     pages = max(1, (total + per_page - 1) // per_page)
 
+    preview = await load_pd_observation(db, run.id)
+    if preview is None:
+        preview = await rebuild_pd_observation(
+            db,
+            tenant_id=tenant_id,
+            run_id=run.id,
+            combine_pd_files=bool(run.combine_pd_files),
+        )
+        if preview is not None:
+            try:
+                await persist_pd_observation_payload(
+                    db,
+                    run_id=run.id,
+                    tenant_id=tenant_id,
+                    engine_version=preview.engine_version,
+                    payload=preview.model_dump(),
+                )
+            except ProgrammingError:
+                await db.rollback()
+    observation, pd_loans = (
+        segment_from_preview(preview, segment_name) if preview is not None else (None, [])
+    )
+    avg_lgd, avg_pd = await _segment_rate_avgs(db, run.id, tenant_id, segment_name)
+    cure_rate = observation.stats.cure_rate if observation is not None else 0.0
+
     return SegmentViewOut(
         segment=segment,
         pdMatrix=pd_matrix,
+        pdObservation=observation,
+        pdLoans=pd_loans,
+        rateStats=SegmentRateStatsOut(
+            cureRate=cure_rate,
+            avgLgd=avg_lgd,
+            avgPd12m=avg_pd,
+        ),
         loans=loans,
         meta={
             "total": total,
