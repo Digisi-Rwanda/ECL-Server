@@ -139,6 +139,46 @@ def test_cure_rate_matches_compute_pd() -> None:
         assert segment.stats.cure_rate == cure_rates[segment.segment]
 
 
+def test_results_payload_keeps_the_observed_3x4() -> None:
+    from app.modules.results.pd_observation import preview_to_payload, segment_from_preview
+    from app.modules.runs.schemas import PdPreviewOut
+
+    preview = _preview()
+    out = PdPreviewOut.model_validate(preview_to_payload(preview))
+    segment, loans = segment_from_preview(out, "Retail")
+    assert segment is not None
+    assert len(segment.dest_labels) == 4
+    assert segment.dest_labels[-1] == "Offbooks"
+    assert all(row.segment == "Retail" for row in loans)
+    assert len(loans) == 7
+
+
+def test_compute_pd_projection_reuses_preview_aggregates() -> None:
+    """ECL must raise the preview's 3x3, not rebuild M[i,j] from a second walk."""
+    _output, cure_rates, intermediates = compute_pd(_portfolio())
+    preview = intermediates["preview"]
+    for observation in preview.observations:
+        stored = np.array(
+            [
+                intermediates["aggregate"][observation.segment][stage]
+                for stage in ("Stage 1", "Stage 2", "Stage 3")
+            ]
+        )
+        assert np.allclose(stored, observation.aggregate_3)
+        assert cure_rates[observation.segment] == observation.cure_rate
+
+
+def test_compute_pd_preview_matches_standalone_builder() -> None:
+    """Validation and compute must emit the same observed matrix and loan rows."""
+    from app.engine import ENGINE_VERSION
+
+    standalone = build_pd_preview(prepare_preview_frame(_portfolio()), engine_version=ENGINE_VERSION)
+    _output, _cure_rates, intermediates = compute_pd(_portfolio())
+    preview = intermediates["preview"]
+    assert preview.loans == standalone.loans
+    assert preview.segments == standalone.segments
+
+
 def test_loans_observed_counts_distinct_ids_not_rows() -> None:
     preview = _preview()
     retail = next(s for s in preview.segments if s.segment == "Retail")
