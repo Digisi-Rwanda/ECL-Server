@@ -61,10 +61,8 @@ from app.engine.pd_engine import (
 from app.engine.pd_preview import (
     PdPreview,
     PdSegmentObservation,
-    build_pd_preview,
     month_key,
     month_label,
-    prepare_preview_frame,
 )
 from app.engine.validators.base import MAX_ISSUES, STAGING_VALUES, ValidationIssue
 
@@ -263,7 +261,9 @@ def combine_pd_sheets(sources: Sequence[PdSourceSheet]) -> pd.DataFrame:
         frames.append(frame)
     if not frames:
         return pd.DataFrame()
-    return pd.concat(frames, ignore_index=True)
+    from app.engine.workbook import concat_sheets
+
+    return concat_sheets(frames)
 
 
 def strip_provenance(df: pd.DataFrame) -> pd.DataFrame:
@@ -993,11 +993,11 @@ def evaluate_pd_validation(
         )
 
     engine_frame = strip_provenance(combined)
-    joined = prepare_preview_frame(engine_frame)
-    preview = build_pd_preview(joined, engine_version=engine_version)
-    # One call to the audited pipeline. The preview never re-derives projected
-    # PD; it inspects what compute_pd actually produced.
-    pd_output, _cure_rates, _intermediates = compute_pd(engine_frame)
+    # One call to the audited pipeline. compute_pd builds the observed preview
+    # from the same prepared frame it projects, so validation and results
+    # cannot drift.
+    pd_output, _cure_rates, intermediates = compute_pd(engine_frame)
+    preview = intermediates["preview"]
 
     criteria.extend(
         [
