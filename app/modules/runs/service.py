@@ -375,8 +375,20 @@ async def _get_run_for_update(db: AsyncSession, tenant_id: str, run_id: str) -> 
 
 
 async def _clear_run_results(db: AsyncSession, run_id: str, tenant_id: str) -> None:
-    from app.modules.results.models import EadResult, LgdResult, OutputArtifact, PdResult
+    from app.modules.results.models import (
+        EadResult,
+        LgdResult,
+        OutputArtifact,
+        PdObservationSnapshot,
+        PdResult,
+    )
 
+    await db.execute(
+        delete(PdObservationSnapshot).where(
+            PdObservationSnapshot.run_id == run_id,
+            PdObservationSnapshot.tenant_id == tenant_id,
+        )
+    )
     await db.execute(
         delete(PdResult).where(PdResult.run_id == run_id, PdResult.tenant_id == tenant_id)
     )
@@ -455,17 +467,17 @@ def _assert_upload_safe(content: bytes, content_type: str) -> None:
 
 
 def _parse_excel(content: bytes) -> tuple[dict[str, pd.DataFrame], int, int]:
-    buffer = io.BytesIO(content)
-    sheets: dict[str, pd.DataFrame] = pd.read_excel(buffer, sheet_name=None, engine="openpyxl")
-    row_count = sum(len(df) for df in sheets.values())
-    return sheets, len(sheets), row_count
+    from app.engine.workbook import read_workbook_sheets, sheets_row_count
+
+    sheets = read_workbook_sheets(content)
+    sheet_count, row_count = sheets_row_count(sheets)
+    return sheets, sheet_count, row_count
 
 
 def _combine_sheets(sheets: dict[str, pd.DataFrame]) -> pd.DataFrame:
-    frames = [df for df in sheets.values() if not df.empty]
-    if not frames:
-        return pd.DataFrame()
-    return pd.concat(frames, ignore_index=True)
+    from app.engine.workbook import concat_sheets
+
+    return concat_sheets(sheets.values())
 
 
 async def _load_uploads(db: AsyncSession, run_id: str) -> list[Upload]:
