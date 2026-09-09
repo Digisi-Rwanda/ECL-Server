@@ -2,6 +2,8 @@ from typing import Literal
 
 from pydantic import BaseModel, Field
 
+from app.modules.runs.schemas import PdLoanPreviewOut, PdSegmentPreviewOut
+
 
 class RunContextOut(BaseModel):
     runId: str
@@ -52,6 +54,12 @@ class PDMatrixOut(BaseModel):
     ]
 
 
+class SegmentRateStatsOut(BaseModel):
+    cureRate: float
+    avgLgd: float | None = None
+    avgPd12m: float | None = None
+
+
 class SegmentViewOut(BaseModel):
     segment: SegmentDataOut
     pdMatrix: tuple[
@@ -59,6 +67,9 @@ class SegmentViewOut(BaseModel):
         tuple[float, float, float],
         tuple[float, float, float],
     ]
+    pdObservation: PdSegmentPreviewOut | None = None
+    pdLoans: list[PdLoanPreviewOut] = Field(default_factory=list)
+    rateStats: SegmentRateStatsOut | None = None
     loans: list[LoanRowOut]
     meta: dict[str, int | bool]
 
