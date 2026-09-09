@@ -285,13 +285,16 @@ def compute_pd(df: pd.DataFrame) -> tuple[pd.DataFrame, dict[str, float], dict[s
     Returns the long-form PD table, cure rates per segment, and intermediate
     matrices for Excel export.
     """
-    # Steps 0-1 — combine/sort (caller combines files; dedupe and sort here).
-    working = prepare_pd_frame(df)
+    from app.engine import ENGINE_VERSION
+    from app.engine.pd_preview import build_pd_preview, month_key, prepare_preview_frame
 
-    # Step 2 — next month staging.
-    working = derive_next_month_staging(working)
+    # Steps 0-7 live in one walk: prepare + preview builds the observed
+    # matrices, cure rate, and loan rows. The projection below only raises
+    # those already-computed 3x3 proportions to powers — it does not
+    # re-derive next-month staging or rebuild M[i,j].
+    working = prepare_preview_frame(df)
+    preview = build_pd_preview(working, engine_version=ENGINE_VERSION)
 
-    segments = segment_names(working)
     monthly_matrices: dict[str, dict[str, dict[str, list[float]]]] = {}
     aggregate_matrices: dict[str, dict[str, list[float]]] = {}
     proportion_matrices: dict[str, dict[str, list[float]]] = {}
@@ -300,28 +303,19 @@ def compute_pd(df: pd.DataFrame) -> tuple[pd.DataFrame, dict[str, float], dict[s
 
     rows: list[dict[str, Any]] = []
 
-    for segment in segments:
-        segment_df = working[working["SEGMENT"] == segment]
-        reporting_months = sorted(segment_df["Reporting Month"].unique())
-
+    for observation in preview.observations:
+        segment = observation.segment
         monthly_matrices[segment] = {}
-        aggregate = np.zeros((3, 3), dtype=np.float64)
+        for reporting_month in observation.months:
+            iso_key = pd.Timestamp(reporting_month).strftime("%Y-%m-%d")
+            observed = observation.monthly_matrices[month_key(reporting_month)]
+            monthly_matrices[segment][iso_key] = _matrix_to_dict(observed[:, :3])
 
-        for reporting_month in reporting_months:
-            month_df = segment_df[segment_df["Reporting Month"] == reporting_month]
-            # Steps 3-4 — the projection pools the 3x3 slice; the Offbooks
-            # column is a preview-only concern.
-            month_matrix = build_monthly_matrix(month_df)[:, :3]
-            aggregate += month_matrix
-            month_key = pd.Timestamp(reporting_month).strftime("%Y-%m-%d")
-            monthly_matrices[segment][month_key] = _matrix_to_dict(month_matrix)
-
-        aggregate_matrices[segment] = _matrix_to_dict(aggregate)
-
-        # Steps 5–7 — row proportions, cure rate, normalize.
-        proportions = row_proportions(aggregate)
+        aggregate_matrices[segment] = _matrix_to_dict(observation.aggregate_3)
+        proportions = observation.proportions_3
         proportion_matrices[segment] = _matrix_to_dict(proportions)
-        cure_rates[segment] = cure_rate_from_proportions(proportions)
+        cure_rates[segment] = observation.cure_rate
+        # Steps 5–7 — absorb Stage 3 for the multi-month projection only.
         normalized = normalize_matrix(proportions)
         normalized_matrices[segment] = _matrix_to_dict(normalized)
 
@@ -379,6 +373,7 @@ def compute_pd(df: pd.DataFrame) -> tuple[pd.DataFrame, dict[str, float], dict[s
         "aggregate": aggregate_matrices,
         "proportion": proportion_matrices,
         "normalized": normalized_matrices,
+        "preview": preview,
     }
 
     return output, cure_rates, intermediates
