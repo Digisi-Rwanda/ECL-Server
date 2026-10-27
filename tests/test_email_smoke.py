@@ -1,9 +1,9 @@
 # Email smoke tests.
 #
-# Mocked tests run in the default suite. Live SMTP tests require:
+# Mocked tests run in the default suite. Live Resend tests require:
 #   SUPPRESS_EMAIL_SEND=false
-#   Valid SMTP_* credentials in .env
-#   Run: pytest tests/test_email_smoke.py -m smtp -v
+#   RESEND_API_KEY in .env, RESEND_TEST_RECIPIENT in the environment
+#   Run: pytest tests/test_email_smoke.py -m resend -v
 
 from __future__ import annotations
 
@@ -53,7 +53,7 @@ async def test_send_email_suppressed(monkeypatch: pytest.MonkeyPatch) -> None:
 
 
 async def test_verification_email_task_eager(monkeypatch: pytest.MonkeyPatch) -> None:
-    """Task pipeline with SUPPRESS_EMAIL_SEND — no real SMTP."""
+    """Task pipeline with SUPPRESS_EMAIL_SEND — no real send."""
     monkeypatch.setenv("CELERY_TASK_ALWAYS_EAGER", "true")
     monkeypatch.setenv("SUPPRESS_EMAIL_SEND", "true")
     from app.config import get_settings
@@ -113,28 +113,28 @@ async def test_full_dispatch_chain(
     assert row.dispatch_attempts == 0
 
 
-@pytest.mark.smtp
-async def test_send_email_live_smtp() -> None:
-    """Send a real email — skipped unless -m smtp is passed."""
+@pytest.mark.resend
+async def test_send_email_live_resend() -> None:
+    """Send a real email via Resend — skipped unless -m resend is passed."""
     import os
 
     if os.environ.get("SUPPRESS_EMAIL_SEND", "false").lower() in ("true", "1", "yes"):
         pytest.skip("SUPPRESS_EMAIL_SEND is enabled")
 
-    recipient = os.environ.get("SMTP_TEST_RECIPIENT")
+    recipient = os.environ.get("RESEND_TEST_RECIPIENT")
     if not recipient:
-        pytest.skip("Set SMTP_TEST_RECIPIENT to run live SMTP test")
+        pytest.skip("Set RESEND_TEST_RECIPIENT to run live Resend test")
 
     from app.config import get_settings
     from app.core.email import send_email
 
     settings = get_settings()
-    if not settings.smtp_username or not settings.smtp_password:
-        pytest.skip("SMTP credentials not configured")
+    if not settings.resend_api_key:
+        pytest.skip("RESEND_API_KEY not configured")
 
     await send_email(
         to=recipient,
-        subject="ECL Platform SMTP smoke test",
+        subject="ECL Platform Resend smoke test",
         template_name="verify_email.html",
         context={
             "user_name": "Smoke Test",

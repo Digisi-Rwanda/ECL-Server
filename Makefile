@@ -72,8 +72,9 @@ seed-dev: $(VENV_BIN)/python ## Seed dev data
 api: $(VENV_BIN)/python ## Start API server only (use when infra is already up)
 	$(VENV_BIN)/uvicorn app.main:app --host 0.0.0.0 --port 8000 --reload
 
-worker: $(VENV_BIN)/python ## Start Celery worker — REQUIRED for email delivery AND ECL compute
-	$(VENV_BIN)/celery -A app.tasks.celery_app worker --loglevel=info --concurrency=4
+worker: $(VENV_BIN)/python ## Start Celery worker + beat — REQUIRED for email delivery (beat drains email_outbox) AND ECL compute
+	@mkdir -p run
+	$(VENV_BIN)/celery -A app.tasks.celery_app worker --beat --loglevel=info --concurrency=4 -n worker@%h --schedule=run/celerybeat-schedule
 
 worker-beat: $(VENV_BIN)/python ## Start Celery worker + beat scheduler (periodic cleanup tasks)
 	@mkdir -p run

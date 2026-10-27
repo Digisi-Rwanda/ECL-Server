@@ -85,5 +85,5 @@ asyncio_default_fixture_loop_scope = "session"
 testpaths = ["tests"]
 markers = [
     "integration: tests requiring MinIO, moto, or other external services",
-    "smtp: live SMTP delivery tests (run with -m smtp)",
+    "resend: live Resend delivery tests (run with -m resend)",
 ]

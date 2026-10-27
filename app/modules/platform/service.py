@@ -564,18 +564,16 @@ async def get_system_health(db: AsyncSession) -> SystemHealthOut:
             ServiceStatus(name="Object Storage", state="down", value="unreachable")
         )
 
-    try:
-        reader, writer = await asyncio.wait_for(
-            asyncio.open_connection(settings.smtp_host, settings.smtp_port),
-            timeout=2.0,
+    # Email goes out via the Resend API; config presence is the cheap signal.
+    if settings.suppress_email_send:
+        email_status = ServiceStatus(name="Email Delivery", state="warn", value="suppressed")
+    elif not settings.resend_api_key:
+        email_status = ServiceStatus(
+            name="Email Delivery", state="down", value="Resend key missing"
         )
-        writer.close()
-        await writer.wait_closed()
-        services.append(ServiceStatus(name="Email Delivery", state="ok", value="operational"))
-    except Exception:
-        services.append(
-            ServiceStatus(name="Email Delivery", state="warn", value="SMTP unreachable")
-        )
+    else:
+        email_status = ServiceStatus(name="Email Delivery", state="ok", value="Resend configured")
+    services.append(email_status)
 
     avg_wait = queued * 60
     queue_stats = QueueStats(running=running, queued=queued, avg_wait_seconds=avg_wait)

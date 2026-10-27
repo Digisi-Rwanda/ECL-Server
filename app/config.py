@@ -50,7 +50,7 @@ class Settings(BaseSettings):
 
     cors_origins: str = "http://localhost:3000"
 
-    smtp_from_email: str = "noreply@eclplatform.com"
+    smtp_from_email: str = "noreply@komputy.com"  # must be on a Resend-verified domain
     smtp_from_name: str = "ECL Platform"
     resend_api_key: str = ""
     demo_notification_email: str = ""  # if empty, falls back to smtp_from_email

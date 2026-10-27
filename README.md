@@ -52,7 +52,7 @@ Verify Redis is reachable: `make dev-check`
 
 Email troubleshooting guide: [docs/EMAIL_DIAGNOSIS_PROMPT.md](docs/EMAIL_DIAGNOSIS_PROMPT.md)
 
-Live SMTP smoke test: `make test` with `pytest tests/test_email_smoke.py -m smtp -v`
+Live Resend smoke test: `RESEND_TEST_RECIPIENT=you@example.com pytest tests/test_email_smoke.py -m resend -v`
 
 ## Tests
 
