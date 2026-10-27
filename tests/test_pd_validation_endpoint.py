@@ -115,7 +115,7 @@ async def ctx() -> AsyncGenerator[_Ctx, None]:
                 created_by_user_id=user_id,
                 name="PD Preview Run",
                 status="draft",
-                engine_version="v1.1.0",
+                engine_version="v1.2.0",
             )
         )
         await db.commit()
@@ -196,7 +196,7 @@ async def test_preview_payload_matches_the_engine(client: AsyncClient, ctx: _Ctx
     response = await client.post(ctx.url(), json={"accepted_warning_ids": []}, headers=ctx.headers)
     preview = response.json()["data"]["pd_preview"]
 
-    assert preview["engine_version"] == "v1.1.0"
+    assert preview["engine_version"] == "v1.2.0"
     assert len(preview["loans"]) == len(_healthy_rows())
 
     first = preview["loans"][0]
@@ -287,7 +287,7 @@ async def test_validation_writes_scoped_audit_events(client: AsyncClient, ctx: _
     )
     assert completed.details["scope"] == "pd"
     assert completed.details["status"] == "ok"
-    assert completed.details["engine_version"] == "v1.1.0"
+    assert completed.details["engine_version"] == "v1.2.0"
     assert completed.details["criteria_counts"]["block"] == 0
 
 
@@ -404,7 +404,7 @@ async def test_blocking_structural_data_returns_200_with_real_criteria(
     # Present but empty, so the client renders the failure rather than falling through.
     assert data["pd_preview"]["loans"] == []
     assert data["pd_preview"]["segments"] == []
-    assert data["pd_preview"]["engine_version"] == "v1.1.0"
+    assert data["pd_preview"]["engine_version"] == "v1.2.0"
 
     async with TestSessionLocal() as db:
         upload = (await db.execute(select(Upload))).scalars().one()
@@ -471,7 +471,7 @@ async def test_run_from_another_tenant_returns_404(client: AsyncClient, ctx: _Ct
                 created_by_user_id=ctx.user_id,
                 name="Someone else's run",
                 status="draft",
-                engine_version="v1.1.0",
+                engine_version="v1.2.0",
             )
         )
         await db.commit()

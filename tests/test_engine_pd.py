@@ -10,6 +10,7 @@ import pandas as pd
 
 from app.engine.pd_engine import (
     MAX_PD_MONTH,
+    _compute_marginal_pd,
     build_monthly_matrix,
     compute_pd,
     cure_rate_from_proportions,
@@ -44,7 +45,7 @@ def test_compute_pd_basic() -> None:
     assert not output.empty
     assert "Marginal_PD" in output.columns
     assert "Retail" in cure_rates
-    assert output["Month"].max() == MAX_PD_MONTH == 300
+    assert output["Month"].max() == MAX_PD_MONTH == 299
 
 
 def test_month_end_join_survives_short_months() -> None:
@@ -115,8 +116,36 @@ def test_cure_rate_uses_pre_absorbing_proportions() -> None:
 
     normalized = normalize_matrix(proportions)
     assert list(normalized[2]) == [0.0, 0.0, 1.0]
-    # The Stage 1 row is left as raw empirical proportions, not renormalized.
-    assert np.allclose(normalized[0], proportions[0])
+    # Stage 1 -> 3 is folded into Stage 2; the Stage 2 row is untouched.
+    assert np.allclose(normalized[0], [0.8, 0.2, 0.0])
+    assert np.allclose(normalized[1], proportions[1])
+
+
+def test_spec_worked_example_segment_st() -> None:
+    """Segment ST balances from the "Lifetime PD Term Structure" spec, Table 1."""
+    aggregate = np.array(
+        [
+            [51_947_744_289, 1_294_413_908, 0],
+            [15_546_083_098, 246_732_943_694, 779_919_373],
+            [0, 119_881_683, 3_610_362_855],
+        ],
+        dtype=np.float64,
+    )
+    proportions = row_proportions(aggregate)
+    assert np.allclose(proportions.sum(axis=1), 1.0)
+    assert round(cure_rate_from_proportions(proportions), 5) == 0.03214
+
+    normalized = normalize_matrix(proportions)
+    assert normalized[0, 2] == 0.0
+    s3 = np.array([np.linalg.matrix_power(normalized, n)[0, 2] for n in range(1, MAX_PD_MONTH + 1)])
+    assert s3[0] == 0.0  # Stage 1 cannot default in month 1
+    assert round(s3[11], 6) == 0.003618  # month 12
+    assert round(s3[-1], 4) == 0.2151  # month 299
+
+
+def test_marginal_pd_is_zero_once_default_saturates() -> None:
+    group = pd.DataFrame({"Stage_3_prob": [0.5, 1.0, 1.0]})
+    assert list(_compute_marginal_pd(group)) == [0.5, 1.0, 0.0]
 
 
 def test_zero_exposure_row_stays_zero() -> None:

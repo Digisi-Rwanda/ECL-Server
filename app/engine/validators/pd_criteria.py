@@ -757,7 +757,7 @@ def _marginal_pd_criterion(pd_output: pd.DataFrame) -> CriterionResult:
             "business",
             "pass",
             "Every computed default probability is between 0% and 100%, and the "
-            "cumulative Stage 3 probability never decreases over the 300-month horizon.",
+            "cumulative Stage 3 probability never decreases over the 299-month horizon.",
         )
     parts = []
     if out_of_bounds:

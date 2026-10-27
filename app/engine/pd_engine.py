@@ -24,7 +24,7 @@ from numpy.linalg import matrix_power
 STAGES = ("Stage 1", "Stage 2", "Stage 3")
 OFFBOOKS = "Offbooks"
 NEXT_STAGES = (*STAGES, OFFBOOKS)
-MAX_PD_MONTH = 300  # PD.ipynb projects P^1 .. P^300 (300 months), not 299
+MAX_PD_MONTH = 299  # spec "Lifetime PD Term Structure" Step 4: powers M^1 .. M^299
 _DENOM_EPS = 1e-15
 
 REPORTING_MONTH_ALIASES = ("Reporting Month", 'Reporting Month ("As At")', "As At")
@@ -226,16 +226,16 @@ def cure_rate_from_proportions(proportions: np.ndarray) -> float:
 def normalize_matrix(proportions: np.ndarray) -> np.ndarray:
     """Step 7 — make Stage 3 absorbing for the multi-month projection.
 
-    Math: N[Stage1] = [P(1,1), P(1,2), P(1,3)]   (left as raw proportions)
-          N[Stage3] = [0, 0, 1]                   (Stage 3 made absorbing)
-    Modelling convention (matches PD.ipynb): only Stage 3 is normalized,
-    into an absorbing state, for the purpose of multi-month projection.
-    Stage 1's raw empirical proportions are kept as-is, including any
-    directly observed Stage 1 -> Stage 3 transitions. The cure possibility
-    is measured separately as cure_rate (above) and re-applied later in
-    ead_engine.py rather than left inside this matrix.
+    Math: N[Stage1] = [P(1,1), P(1,2) + P(1,3), 0]   (no direct 1 -> 3 jump)
+          N[Stage2] = [P(2,1), P(2,2), P(2,3)]       (unchanged)
+          N[Stage3] = [0, 0, 1]                       (Stage 3 made absorbing)
+    Per the "Lifetime PD Term Structure" spec Step 3: a Stage 1 loan must
+    pass through Stage 2 before defaulting, so its observed 1 -> 3 share is
+    folded into Stage 2. The cure possibility is measured separately as
+    cure_rate (above) and re-applied later in ead_engine.py.
     """
     normalized = proportions.copy()
+    normalized[0] = [proportions[0, 0], proportions[0, 1] + proportions[0, 2], 0.0]
     normalized[2] = [0.0, 0.0, 1.0]
     return normalized
 
@@ -252,9 +252,8 @@ def _compute_marginal_pd(group: pd.DataFrame) -> pd.Series:
     # given the loan was still not in default going into month n." This
     # marginal_PD is the "PD" plugged into the Credit Loss formula in
     # ead_engine.py. When the prior month's cumulative default probability
-    # has already saturated to ~100% (denom ~= 0), marginal PD is treated
-    # as certain (1) rather than 0 -- matches PD.ipynb's
-    # "if prev_default == 1: marginal_PD = 1".
+    # has already saturated to ~100% (denom ~= 0), there is nothing left to
+    # default, so marginal PD is 0 (spec Step 7, rule 3).
     s3 = group["Stage_3_prob"].to_numpy(dtype=np.float64)
     marginal = np.zeros(len(s3), dtype=np.float64)
     if len(s3) == 0:
@@ -263,7 +262,7 @@ def _compute_marginal_pd(group: pd.DataFrame) -> pd.Series:
     for idx in range(1, len(s3)):
         denom = 1.0 - s3[idx - 1]
         if denom <= _DENOM_EPS:
-            marginal[idx] = 1.0
+            marginal[idx] = 0.0
         else:
             marginal[idx] = (s3[idx] - s3[idx - 1]) / denom
     return pd.Series(marginal, index=group.index)
