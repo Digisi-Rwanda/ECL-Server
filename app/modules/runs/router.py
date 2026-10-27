@@ -1,5 +1,6 @@
 import asyncio
 from pathlib import Path
+from urllib.parse import quote
 
 from fastapi import APIRouter, Depends, File, Form, Query, Request, UploadFile, status
 from fastapi.responses import FileResponse, Response
@@ -332,6 +333,40 @@ async def delete_run_endpoint(
         user.id,
         ip=get_client_ip(request.headers.get("X-Forwarded-For")),
         user_agent=get_user_agent(request.headers.get("User-Agent")),
+    )
+
+
+@router.get("/{tenant_id}/runs/{run_id}/inputs/bundle")
+async def download_inputs_bundle_endpoint(
+    tenant_id: str,
+    run_id: str,
+    db: DbSession,
+    user: CurrentUser,
+    _m: TenantMembership = Depends(require_tenant_member),
+) -> Response:
+    content, filename = await service.build_inputs_bundle(db, tenant_id, run_id)
+    return Response(
+        content=content,
+        media_type="application/zip",
+        headers={"Content-Disposition": f'attachment; filename="{filename}"'},
+    )
+
+
+@router.get("/{tenant_id}/runs/{run_id}/inputs/{kind}/file")
+async def download_input_file_endpoint(
+    tenant_id: str,
+    run_id: str,
+    kind: str,
+    db: DbSession,
+    user: CurrentUser,
+    _m: TenantMembership = Depends(require_tenant_member),
+) -> Response:
+    content, filename = await service.get_input_file_bytes(db, tenant_id, run_id, kind)
+    # User-supplied names may hold quotes or non-Latin-1 characters; RFC 5987 form is safe.
+    return Response(
+        content=content,
+        media_type="application/octet-stream",
+        headers={"Content-Disposition": f"attachment; filename*=UTF-8''{quote(filename)}"},
     )
 
 

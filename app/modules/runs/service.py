@@ -692,6 +692,39 @@ async def _input_files(
     return files
 
 
+async def _latest_uploads_by_kind(db: AsyncSession, tenant_id: str, run_id: str) -> dict[str, Upload]:
+    run = (
+        await db.execute(
+            select(Run.id).where(Run.id == run_id, Run.tenant_id == tenant_id, Run.deleted_at.is_(None))
+        )
+    ).scalar_one_or_none()
+    if not run:
+        raise ECLException("RESOURCE_NOT_FOUND", "Run not found.", 404)
+    # Ordered oldest-first, so a re-upload of the same kind wins.
+    return {u.kind.upper(): u for u in await _load_uploads(db, run_id)}
+
+
+async def get_input_file_bytes(
+    db: AsyncSession, tenant_id: str, run_id: str, kind: str
+) -> tuple[bytes, str]:
+    upload = (await _latest_uploads_by_kind(db, tenant_id, run_id)).get(kind.upper())
+    if upload is None:
+        raise ECLException("RESOURCE_NOT_FOUND", f"No {kind.upper()} input for this run.", 404)
+    return await download_bytes(upload.storage_path), upload.original_filename
+
+
+async def build_inputs_bundle(db: AsyncSession, tenant_id: str, run_id: str) -> tuple[bytes, str]:
+    uploads = await _latest_uploads_by_kind(db, tenant_id, run_id)
+    if not uploads:
+        raise ECLException("RESOURCE_NOT_FOUND", "This run has no input files.", 404)
+    buffer = io.BytesIO()
+    with zipfile.ZipFile(buffer, "w", zipfile.ZIP_DEFLATED) as archive:
+        for kind, upload in sorted(uploads.items()):
+            # Prefix with the kind so two inputs sharing a filename don't collide.
+            archive.writestr(f"{kind}_{upload.original_filename}", await download_bytes(upload.storage_path))
+    return buffer.getvalue(), f"ECL_{run_id}_inputs.zip"
+
+
 async def _run_list_item(
     run: Run,
     user: User,
