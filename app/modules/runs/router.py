@@ -386,6 +386,25 @@ async def download_workbooks_bundle_endpoint(
     )
 
 
+@router.get("/{tenant_id}/runs/{run_id}/pd/export")
+@limiter.limit("10/minute")
+async def pd_export_endpoint(
+    request: Request,
+    tenant_id: str,
+    run_id: str,
+    db: DbSession,
+    user: CurrentUser,
+    _m: TenantMembership = Depends(require_tenant_member),
+) -> Response:
+    # PD Calcs.xlsx straight from the PD uploads, before LGD/EAD exist.
+    content, filename = await pd_validation.build_pd_export(db, tenant_id, run_id)
+    return Response(
+        content=content,
+        media_type="application/vnd.openxmlformats-officedocument.spreadsheetml.sheet",
+        headers={"Content-Disposition": f'attachment; filename="{filename}"'},
+    )
+
+
 @router.get("/{tenant_id}/runs/{run_id}/downloads/{kind}/file")
 async def download_artifact_file_endpoint(
     tenant_id: str,

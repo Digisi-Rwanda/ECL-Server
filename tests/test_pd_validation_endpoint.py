@@ -515,3 +515,31 @@ async def test_unrecognized_scope_falls_through_to_the_unscoped_path(
     )
     assert response.status_code == 400
     assert response.json()["code"] == "MISSING_UPLOADS"
+
+
+async def test_preview_carries_the_term_structure(client: AsyncClient, ctx: _Ctx) -> None:
+    await _add_upload(ctx, _workbook(_healthy_rows()))
+    response = await client.post(ctx.url(), json={"accepted_warning_ids": []}, headers=ctx.headers)
+    assert response.status_code == 200
+    segment = response.json()["data"]["pd_preview"]["segments"][0]
+    assert len(segment["proportions"]) == 3 and len(segment["normalized"]) == 3
+    assert segment["normalized"][2] == [0.0, 0.0, 1.0]
+    assert [len(t) for t in segment["term_structure"]] == [299, 299, 299]
+    assert all(len(row) == 4 for row in segment["term_structure"][0])
+
+
+async def test_pd_export_needs_only_the_pd_upload(client: AsyncClient, ctx: _Ctx) -> None:
+    from openpyxl import load_workbook
+
+    await _add_upload(ctx, _workbook(_healthy_rows()))
+    url = f"/api/v1/tenants/{ctx.tenant_id}/runs/{ctx.run_id}/pd/export"
+    response = await client.get(url, headers=ctx.headers)
+    assert response.status_code == 200, response.text
+    wb = load_workbook(io.BytesIO(response.content))
+    assert wb.sheetnames[:3] == ["Transition Matrix", "Normalized Matrix", "Dataset"]
+
+
+async def test_pd_export_without_pd_upload_is_400(client: AsyncClient, ctx: _Ctx) -> None:
+    url = f"/api/v1/tenants/{ctx.tenant_id}/runs/{ctx.run_id}/pd/export"
+    response = await client.get(url, headers=ctx.headers)
+    assert response.status_code == 400

@@ -370,3 +370,49 @@ async def validate_pd_files(
 
 
 __all__ = ["resolve_pd_thresholds", "validate_pd_files"]
+
+
+async def build_pd_export(db: AsyncSession, tenant_id: str, run_id: str) -> tuple[bytes, str]:
+    """PD Calcs.xlsx from the run's PD uploads alone — no EAD or LGD needed.
+
+    Mirrors compute's PD input exactly (upload order, combine flag, PD-sheet
+    predicate) and runs the same compute_pd + workbook writer, so this file
+    matches the PD Calcs.xlsx a full run would produce.
+    """
+    import asyncio
+    from datetime import UTC, datetime
+
+    from app.engine.excel_writer import _build_pd_calcs_workbook
+    from app.engine.pd_engine import compute_pd, is_pd_data_sheet
+    from app.engine.workbook import frames_from_workbooks
+    from app.modules.runs.service import _get_run
+
+    run = await _get_run(db, tenant_id, run_id)
+    result = await db.execute(
+        select(Upload)
+        .where(Upload.run_id == run_id, Upload.kind == UploadKind.PD.value)
+        .order_by(Upload.created_at)
+    )
+    uploads = list(result.scalars().all())
+    if not uploads:
+        raise ECLException("NO_PD_UPLOADS", "Upload at least one PD file before exporting PD.", 400)
+    if not run.combine_pd_files:
+        uploads = uploads[:1]
+
+    files = [await download_bytes(u.storage_path) for u in uploads]
+
+    def _build() -> bytes:
+        pd_input = frames_from_workbooks(files, keep_sheet=is_pd_data_sheet)
+        pd_df, _cure, intermediates = compute_pd(pd_input)
+        run_meta = {
+            "run_id": run.id,
+            "tenant_id": run.tenant_id,
+            "timestamp_utc": datetime.now(UTC).isoformat(),
+            "engine_version": run.engine_version or ENGINE_VERSION,
+            "input_hashes": ",".join(hashlib.sha256(f).hexdigest()[:12] for f in files),
+        }
+        return _build_pd_calcs_workbook(run_meta, {"pd_df": pd_df, "intermediates": intermediates})
+
+    content = await asyncio.to_thread(_build)
+    log.info("pd_export_built", run_id=run_id, tenant_id=tenant_id, bytes=len(content))
+    return content, "PD Calcs.xlsx"
