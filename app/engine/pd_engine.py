@@ -243,7 +243,25 @@ def normalize_matrix(proportions: np.ndarray) -> np.ndarray:
 _normalize_matrix = normalize_matrix
 
 
-def _compute_marginal_pd(group: pd.DataFrame) -> pd.Series:
+def project_term_structure(normalized: np.ndarray) -> np.ndarray:
+    """Steps 4-5 — powers M^1 .. M^MAX_PD_MONTH of the normalized matrix.
+
+    Returns shape (3, MAX_PD_MONTH, 3): [starting stage, month - 1, stage j],
+    i.e. the Transition row of M^month. Shared by compute_pd and the
+    validate-time preview so both show the exact same numbers.
+    """
+    # Math: P^(n) = P x P x ... x P   (n times, matrix multiplication)
+    # (P^n)[i, j] = probability of being in stage j after n months,
+    # starting from stage i -- the standard Chapman-Kolmogorov
+    # projection for a time-homogeneous discrete Markov chain.
+    # matrix_power (not a running product) keeps results bit-identical to
+    # the figures already feeding ECL.
+    powers = np.stack([matrix_power(normalized, month) for month in range(1, MAX_PD_MONTH + 1)])
+    return powers.transpose(1, 0, 2)
+
+
+def marginal_pd_from_cumulative(s3: np.ndarray) -> np.ndarray:
+    """Step 7 — marginal PD for one (segment, transition) group, months ascending."""
     # Math: marginal_PD(n) = (S3(n) - S3(n-1)) / (1 - S3(n-1))
     #   S3(n) = cumulative probability of Stage 3 (default) by month n
     # This is the discrete hazard-rate formula from survival analysis,
@@ -254,10 +272,9 @@ def _compute_marginal_pd(group: pd.DataFrame) -> pd.Series:
     # ead_engine.py. When the prior month's cumulative default probability
     # has already saturated to ~100% (denom ~= 0), there is nothing left to
     # default, so marginal PD is 0 (spec Step 7, rule 3).
-    s3 = group["Stage_3_prob"].to_numpy(dtype=np.float64)
     marginal = np.zeros(len(s3), dtype=np.float64)
     if len(s3) == 0:
-        return pd.Series(marginal, index=group.index)
+        return marginal
     marginal[0] = s3[0]
     for idx in range(1, len(s3)):
         denom = 1.0 - s3[idx - 1]
@@ -265,7 +282,12 @@ def _compute_marginal_pd(group: pd.DataFrame) -> pd.Series:
             marginal[idx] = 0.0
         else:
             marginal[idx] = (s3[idx] - s3[idx - 1]) / denom
-    return pd.Series(marginal, index=group.index)
+    return marginal
+
+
+def _compute_marginal_pd(group: pd.DataFrame) -> pd.Series:
+    s3 = group["Stage_3_prob"].to_numpy(dtype=np.float64)
+    return pd.Series(marginal_pd_from_cumulative(s3), index=group.index)
 
 
 def segment_names(df: pd.DataFrame) -> list[Any]:
@@ -319,21 +341,18 @@ def compute_pd(df: pd.DataFrame) -> tuple[pd.DataFrame, dict[str, float], dict[s
         normalized_matrices[segment] = _matrix_to_dict(normalized)
 
         # Steps 8–9 — matrix powers and long-form table.
+        term = project_term_structure(normalized)
         for month in range(1, MAX_PD_MONTH + 1):
-            # Math: P^(n) = P x P x ... x P   (n times, matrix multiplication)
-            # (P^n)[i, j] = probability of being in stage j after n months,
-            # starting from stage i -- the standard Chapman-Kolmogorov
-            # projection for a time-homogeneous discrete Markov chain.
-            powered = matrix_power(normalized, month)
             for transition_idx, transition in enumerate(STAGES):
+                powered_row = term[transition_idx, month - 1]
                 rows.append(
                     {
                         "SEGMENT": segment,
                         "Month": month,
                         "Transition": transition,
-                        "Stage_1_prob": float(powered[transition_idx, 0]),
-                        "Stage_2_prob": float(powered[transition_idx, 1]),
-                        "Stage_3_prob": float(powered[transition_idx, 2]),
+                        "Stage_1_prob": float(powered_row[0]),
+                        "Stage_2_prob": float(powered_row[1]),
+                        "Stage_3_prob": float(powered_row[2]),
                     }
                 )
 
