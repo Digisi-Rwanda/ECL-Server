@@ -198,6 +198,10 @@ def _segment_out(segment: PdSegmentPreview) -> PdSegmentPreviewOut:
             loans_observed=segment.stats.loans_observed,
             months_of_history=segment.stats.months_of_history,
         ),
+        proportions=segment.proportions,
+        observed_3=segment.observed_3,
+        normalized=segment.normalized,
+        term_structure=segment.term_structure,
     )
 
 

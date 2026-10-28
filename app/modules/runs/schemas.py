@@ -205,6 +205,12 @@ class PdSegmentPreviewOut(BaseModel):
     amounts: list[list[str]]
     dest_labels: list[str]
     stats: PdSegmentStatsOut
+    # Lifetime PD term structure (spec Steps 1-7), identical to compute_pd.
+    proportions: list[list[float]]
+    observed_3: list[list[str]]
+    normalized: list[list[float]]
+    # [transition][month - 1] = [Stage 1, Stage 2, Stage 3, Marginal PD], months 1..299
+    term_structure: list[list[list[float]]]
 
 
 class PdPreviewOut(BaseModel):

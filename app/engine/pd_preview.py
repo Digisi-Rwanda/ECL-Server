@@ -35,7 +35,10 @@ from app.engine.pd_engine import (
     build_monthly_matrix,
     cure_rate_from_proportions,
     derive_next_month_staging,
+    marginal_pd_from_cumulative,
+    normalize_matrix,
     prepare_pd_frame,
+    project_term_structure,
     row_proportions,
     segment_names,
 )
@@ -122,6 +125,12 @@ class PdSegmentPreview:
     amounts: list[list[str]]
     dest_labels: list[str]
     stats: PdSegmentStats
+    # Spec "Lifetime PD Term Structure" Steps 1-7, same arithmetic as compute_pd.
+    proportions: list[list[float]]  # Step 1: 3x3, Offbooks dropped, rows sum to 1
+    observed_3: list[list[str]]  # Step 1 input balances (3x3), pre-formatted
+    normalized: list[list[float]]  # Step 3
+    # Steps 4-7: [transition][month - 1] = [Stage 1, Stage 2, Stage 3, Marginal PD]
+    term_structure: list[list[list[float]]]
 
 
 @dataclass(frozen=True, slots=True)
@@ -205,7 +214,22 @@ def _segment_observation(segment: str, segment_df: pd.DataFrame) -> PdSegmentObs
     )
 
 
+def _term_structure(normalized: np.ndarray) -> list[list[list[float]]]:
+    term = project_term_structure(normalized)
+    out = []
+    for rows in term:
+        marginal = marginal_pd_from_cumulative(rows[:, 2])
+        out.append(
+            [
+                [float(s1), float(s2), float(s3), float(m)]
+                for (s1, s2, s3), m in zip(rows, marginal, strict=True)
+            ]
+        )
+    return out
+
+
 def _to_segment_preview(observation: PdSegmentObservation) -> PdSegmentPreview:
+    normalized = normalize_matrix(observation.proportions_3)
     return PdSegmentPreview(
         segment=observation.segment,
         # Full float64 on the wire; the client renders, it does not re-derive.
@@ -218,6 +242,12 @@ def _to_segment_preview(observation: PdSegmentObservation) -> PdSegmentPreview:
             loans_observed=observation.loans_observed,
             months_of_history=len(observation.months),
         ),
+        proportions=[[float(v) for v in row] for row in observation.proportions_3],
+        observed_3=[
+            [format_compact_amount(float(v)) for v in row] for row in observation.aggregate_3
+        ],
+        normalized=[[float(v) for v in row] for row in normalized],
+        term_structure=_term_structure(normalized),
     )
 
 
