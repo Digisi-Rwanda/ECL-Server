@@ -3,9 +3,8 @@ from pathlib import Path
 from urllib.parse import quote
 
 from fastapi import APIRouter, Depends, File, Form, Query, Request, UploadFile, status
-from fastapi.responses import FileResponse, Response
+from fastapi.responses import FileResponse, JSONResponse, Response
 
-from app.core.exceptions import ECLException
 from app.core.limiter import limiter
 from app.core.logging import get_logger
 from app.dependencies import (
@@ -22,10 +21,7 @@ from app.modules.runs import ecl_validation, pd_validation, service
 from app.modules.runs.schemas import (
     AcceptReviewResponse,
     CreateRunRequest,
-    EadValidationResponse,
     ExecuteRunResponse,
-    LgdValidationResponse,
-    PdValidationResponse,
     PresignedDownloadResponse,
     RerunRequest,
     RunListResponse,
@@ -40,11 +36,13 @@ from app.tasks.compute_tasks import (
     lgd_task,
     pd_task,
     schedule_inline_compute,
+    validation_task,
 )
 
 _log = get_logger("runs.router")
 
 router = APIRouter(prefix="/tenants", tags=["runs"])
+_inline_validation_jobs: set[asyncio.Task[None]] = set()
 
 _TEMPLATES_DIR = Path(__file__).resolve().parents[2] / "static" / "templates"
 
@@ -152,28 +150,51 @@ async def validate_files_endpoint(
     user: CurrentUser,
     scope: str | None = Query(default=None),
     _a: TenantMembership = Depends(require_tenant_analyst_or_admin),
-) -> PdValidationResponse | LgdValidationResponse | EadValidationResponse:
-    # One lane: PD, then LGD, then EAD, each validated on its own. EAD's
-    # checklist includes the cross-file checks and the full ECL preview.
+) -> JSONResponse:
+    # One lane: PD, then LGD, then EAD, each validated on its own. The work runs
+    # as a background job (it parses whole workbooks and, for EAD, previews the
+    # full ECL); this request only records it, so it can never time out.
+    from app.core.cache import get_redis_client
+    from app.modules.runs.service import _get_run
+    from app.modules.runs.validation_jobs import create_job, run_job_isolated
+
     scope_key = (scope or "").strip().lower()
-    client = {
-        "ip": get_client_ip(request.headers.get("X-Forwarded-For")),
-        "user_agent": get_user_agent(request.headers.get("User-Agent")),
-    }
-    _log.info("validation_requested", run_id=run_id, tenant_id=tenant_id, user_id=user.id, scope=scope_key)
-    if scope_key == "pd":
-        return PdValidationResponse(
-            data=await pd_validation.validate_pd_files(db, tenant_id, run_id, user.id, **client)
-        )
-    if scope_key == "lgd":
-        return LgdValidationResponse(
-            data=await ecl_validation.validate_lgd_files(db, tenant_id, run_id, user.id, **client)
-        )
-    if scope_key == "ead":
-        return EadValidationResponse(
-            data=await ecl_validation.validate_ead_files(db, tenant_id, run_id, user.id, **client)
-        )
-    raise ECLException("INVALID_SCOPE", "scope must be pd, lgd or ead.", 400)
+    await _get_run(db, tenant_id, run_id)
+    redis = await get_redis_client()
+    job_id, created = await create_job(redis, tenant_id=tenant_id, run_id=run_id, scope=scope_key)
+    _log.info("validation_job_requested", run_id=run_id, scope=scope_key, job_id=job_id, created=created)
+    if created:
+        client = {
+            "ip": get_client_ip(request.headers.get("X-Forwarded-For")),
+            "user_agent": get_user_agent(request.headers.get("User-Agent")),
+        }
+        if await celery_workers_available():
+            await asyncio.to_thread(
+                lambda: validation_task.delay(job_id, tenant_id, run_id, user.id, scope_key, **client)
+            )
+        else:
+            task = asyncio.create_task(run_job_isolated(
+                job_id=job_id, tenant_id=tenant_id, run_id=run_id,
+                user_id=user.id, scope=scope_key, **client,
+            ))
+            _inline_validation_jobs.add(task)
+            task.add_done_callback(_inline_validation_jobs.discard)
+    return JSONResponse(status_code=202, content={"data": {"jobId": job_id, "status": "queued"}})
+
+
+@router.get("/{tenant_id}/runs/{run_id}/validation-jobs/{job_id}")
+async def validation_job_endpoint(
+    tenant_id: str,
+    run_id: str,
+    job_id: str,
+    user: CurrentUser,
+    _m: TenantMembership = Depends(require_tenant_member),
+) -> JSONResponse:
+    from app.core.cache import get_redis_client
+    from app.modules.runs.validation_jobs import get_job
+
+    job = await get_job(await get_redis_client(), tenant_id=tenant_id, run_id=run_id, job_id=job_id)
+    return JSONResponse(content={"data": job}, headers={"Cache-Control": "no-store"})
 
 
 @router.post("/{tenant_id}/runs/{run_id}/validation/{kind}/accept")

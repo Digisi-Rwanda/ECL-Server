@@ -22,6 +22,7 @@ from app.modules.collateral.models import CollateralType
 from app.modules.runs.models import Run, Upload
 from app.modules.tenants.models import Tenant, TenantMembership
 from tests.conftest import TestSessionLocal
+from tests.validation_client import post_validate
 
 _FILES: dict[str, bytes] = {}
 MONTHS = ["2024-10-31", "2024-11-30", "2024-12-31", "2025-01-31", "2025-02-28", "2025-03-31"]
@@ -122,7 +123,7 @@ async def _upload(ctx: Ctx, kind: str, content: bytes) -> str:
 
 
 async def _validate(client: AsyncClient, ctx: Ctx, scope: str) -> dict:
-    r = await client.post(ctx.url(f"validate?scope={scope}"), json={}, headers=ctx.headers)
+    r = await post_validate(client,ctx.url(f"validate?scope={scope}"), json={}, headers=ctx.headers)
     assert r.status_code == 200, r.text
     return r.json()["data"]
 
@@ -209,7 +210,7 @@ async def test_missing_columns_block_lgd(client: AsyncClient, ctx: Ctx) -> None:
 
 @pytest.mark.asyncio
 async def test_unknown_scope_is_rejected(client: AsyncClient, ctx: Ctx) -> None:
-    r = await client.post(ctx.url("validate"), json={}, headers=ctx.headers)
+    r = await post_validate(client,ctx.url("validate"), json={}, headers=ctx.headers)
     assert r.status_code == 400
 
 
@@ -228,3 +229,14 @@ async def test_reporting_date_change_resets_ead_validation(client: AsyncClient, 
     # Every loan is dated 2025-03-31, so all are excluded against the run's date.
     assert _codes(ead)["EA-12"]["outcome"] == "review"
     assert ead["preview"]["reportingDateSource"] == "run"
+
+
+@pytest.mark.asyncio
+async def test_double_click_joins_the_running_validation_job(client: AsyncClient, ctx: Ctx) -> None:
+    await _upload(ctx, UploadKind.PD.value, _pd_file())
+    first = await client.post(ctx.url("validate?scope=pd"), json={}, headers=ctx.headers)
+    second = await client.post(ctx.url("validate?scope=pd"), json={}, headers=ctx.headers)
+    assert first.status_code == second.status_code == 202
+    assert first.json()["data"]["jobId"] == second.json()["data"]["jobId"]
+    done = await post_validate(client, ctx.url("validate?scope=pd"), json={}, headers=ctx.headers)
+    assert done.status_code == 200 and done.json()["data"]["status"] in ("ok", "warn")

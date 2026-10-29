@@ -28,6 +28,7 @@ from app.modules.runs.models import PdValidationThresholds, Run, Upload
 from app.modules.segments.models import Segment
 from app.modules.tenants.models import Tenant, TenantMembership
 from tests.conftest import TestSessionLocal
+from tests.validation_client import post_validate
 
 MONTH_ENDS = ["2024-10-31", "2024-11-30", "2024-12-31", "2025-01-31", "2025-02-28"]
 
@@ -165,7 +166,7 @@ async def test_single_pd_file_returns_the_full_checklist_and_preview(
 ) -> None:
     await _add_upload(ctx, _workbook(_healthy_rows()))
 
-    response = await client.post(ctx.url(), json={"accepted_warning_ids": []}, headers=ctx.headers)
+    response = await post_validate(client,ctx.url(), json={"accepted_warning_ids": []}, headers=ctx.headers)
     assert response.status_code == 200, response.text
     data = response.json()["data"]
 
@@ -194,7 +195,7 @@ async def test_preview_payload_matches_the_engine(client: AsyncClient, ctx: _Ctx
     """Every displayed number is computed server-side; the client only renders."""
     await _add_upload(ctx, _workbook(_healthy_rows()))
 
-    response = await client.post(ctx.url(), json={"accepted_warning_ids": []}, headers=ctx.headers)
+    response = await post_validate(client,ctx.url(), json={"accepted_warning_ids": []}, headers=ctx.headers)
     preview = response.json()["data"]["pd_preview"]
 
     assert preview["engine_version"] == ENGINE_VERSION
@@ -227,7 +228,7 @@ async def test_validation_marks_only_the_pd_uploads(client: AsyncClient, ctx: _C
         ctx, b"not read on this path", kind=UploadKind.LGD.value, filename="lgd.xlsx"
     )
 
-    await client.post(ctx.url(), json={"accepted_warning_ids": []}, headers=ctx.headers)
+    await post_validate(client,ctx.url(), json={"accepted_warning_ids": []}, headers=ctx.headers)
 
     async with TestSessionLocal() as db:
         uploads = {
@@ -244,7 +245,7 @@ async def test_thresholds_and_segments_are_provisioned_on_first_use(
 ) -> None:
     await _add_upload(ctx, _workbook(_healthy_rows()))
 
-    response = await client.post(ctx.url(), json={"accepted_warning_ids": []}, headers=ctx.headers)
+    response = await post_validate(client,ctx.url(), json={"accepted_warning_ids": []}, headers=ctx.headers)
     assert response.status_code == 200
 
     async with TestSessionLocal() as db:
@@ -274,7 +275,7 @@ async def test_thresholds_and_segments_are_provisioned_on_first_use(
 @pytest.mark.asyncio
 async def test_validation_writes_scoped_audit_events(client: AsyncClient, ctx: _Ctx) -> None:
     await _add_upload(ctx, _workbook(_healthy_rows()))
-    await client.post(ctx.url(), json={"accepted_warning_ids": []}, headers=ctx.headers)
+    await post_validate(client,ctx.url(), json={"accepted_warning_ids": []}, headers=ctx.headers)
 
     async with TestSessionLocal() as db:
         logs = (await db.execute(select(AuditLog).order_by(AuditLog.created_at))).scalars().all()
@@ -297,8 +298,8 @@ async def test_validation_is_repeatable(client: AsyncClient, ctx: _Ctx) -> None:
     """Nothing is persisted, so a second call must return the identical payload."""
     await _add_upload(ctx, _workbook(_healthy_rows()))
 
-    first = await client.post(ctx.url(), json={"accepted_warning_ids": []}, headers=ctx.headers)
-    second = await client.post(ctx.url(), json={"accepted_warning_ids": []}, headers=ctx.headers)
+    first = await post_validate(client,ctx.url(), json={"accepted_warning_ids": []}, headers=ctx.headers)
+    second = await post_validate(client,ctx.url(), json={"accepted_warning_ids": []}, headers=ctx.headers)
 
     assert first.status_code == second.status_code == 200
     assert first.json() == second.json()
@@ -307,7 +308,7 @@ async def test_validation_is_repeatable(client: AsyncClient, ctx: _Ctx) -> None:
 @pytest.mark.asyncio
 async def test_scope_matching_is_case_insensitive(client: AsyncClient, ctx: _Ctx) -> None:
     await _add_upload(ctx, _workbook(_healthy_rows()))
-    response = await client.post(
+    response = await post_validate(client,
         ctx.url(scope="PD"), json={"accepted_warning_ids": []}, headers=ctx.headers
     )
     assert response.status_code == 200
@@ -336,7 +337,7 @@ async def test_multiple_pd_files_are_always_combined_for_the_preview(
         run.combine_pd_files = False
         await db.commit()
 
-    response = await client.post(ctx.url(), json={"accepted_warning_ids": []}, headers=ctx.headers)
+    response = await post_validate(client,ctx.url(), json={"accepted_warning_ids": []}, headers=ctx.headers)
     assert response.status_code == 200
     data = response.json()["data"]
 
@@ -355,7 +356,7 @@ async def test_duplicate_rows_across_two_files_block(client: AsyncClient, ctx: _
         ctx, _workbook(_healthy_rows()[:1]), filename="pd_b.xlsx"
     )
 
-    response = await client.post(ctx.url(), json={"accepted_warning_ids": []}, headers=ctx.headers)
+    response = await post_validate(client,ctx.url(), json={"accepted_warning_ids": []}, headers=ctx.headers)
     assert response.status_code == 200
     data = response.json()["data"]
 
@@ -377,7 +378,7 @@ async def test_non_data_sheets_are_skipped(client: AsyncClient, ctx: _Ctx) -> No
     }
     await _add_upload(ctx, _workbook([], sheets=sheets))
 
-    response = await client.post(ctx.url(), json={"accepted_warning_ids": []}, headers=ctx.headers)
+    response = await post_validate(client,ctx.url(), json={"accepted_warning_ids": []}, headers=ctx.headers)
     assert response.status_code == 200
     assert response.json()["data"]["status"] == "ok"
     assert "1 sheet(s) were skipped" in _codes(response.json())["EC-18"]["rationale"]
@@ -394,7 +395,7 @@ async def test_blocking_structural_data_returns_200_with_real_criteria(
     rows = [*_healthy_rows(), ("L900", MONTH_ENDS[0], "Stage 4", 10_000.0, "Retail")]
     await _add_upload(ctx, _workbook(rows))
 
-    response = await client.post(ctx.url(), json={"accepted_warning_ids": []}, headers=ctx.headers)
+    response = await post_validate(client,ctx.url(), json={"accepted_warning_ids": []}, headers=ctx.headers)
     assert response.status_code == 200
     data = response.json()["data"]
 
@@ -417,7 +418,7 @@ async def test_warnings_return_200_with_status_warn(client: AsyncClient, ctx: _C
     rows = [row for row in _healthy_rows() if row[1] != MONTH_ENDS[2]]
     await _add_upload(ctx, _workbook(rows))
 
-    response = await client.post(ctx.url(), json={"accepted_warning_ids": []}, headers=ctx.headers)
+    response = await post_validate(client,ctx.url(), json={"accepted_warning_ids": []}, headers=ctx.headers)
     assert response.status_code == 200
     assert response.json()["data"]["status"] == "warn"
     assert _codes(response.json())["EC-11"]["outcome"] == "review"
@@ -434,7 +435,7 @@ async def test_warnings_return_200_with_status_warn(client: AsyncClient, ctx: _C
 async def test_no_pd_upload_returns_400(client: AsyncClient, ctx: _Ctx) -> None:
     await _add_upload(ctx, b"lgd", kind=UploadKind.LGD.value, filename="lgd.xlsx")
 
-    response = await client.post(ctx.url(), json={"accepted_warning_ids": []}, headers=ctx.headers)
+    response = await post_validate(client,ctx.url(), json={"accepted_warning_ids": []}, headers=ctx.headers)
     assert response.status_code == 400
     assert response.json()["code"] == "NO_PD_UPLOADS"
 
@@ -443,7 +444,7 @@ async def test_no_pd_upload_returns_400(client: AsyncClient, ctx: _Ctx) -> None:
 async def test_unreadable_workbook_returns_422(client: AsyncClient, ctx: _Ctx) -> None:
     await _add_upload(ctx, b"this is not a workbook", filename="broken.xlsx")
 
-    response = await client.post(ctx.url(), json={"accepted_warning_ids": []}, headers=ctx.headers)
+    response = await post_validate(client,ctx.url(), json={"accepted_warning_ids": []}, headers=ctx.headers)
     assert response.status_code == 422
     body = response.json()
     assert body["code"] == "INVALID_FILE"
@@ -452,7 +453,7 @@ async def test_unreadable_workbook_returns_422(client: AsyncClient, ctx: _Ctx) -
 
 @pytest.mark.asyncio
 async def test_unknown_run_returns_404(client: AsyncClient, ctx: _Ctx) -> None:
-    response = await client.post(
+    response = await post_validate(client,
         ctx.url(run_id=new_ulid()), json={"accepted_warning_ids": []}, headers=ctx.headers
     )
     assert response.status_code == 404
@@ -477,7 +478,7 @@ async def test_run_from_another_tenant_returns_404(client: AsyncClient, ctx: _Ct
         )
         await db.commit()
 
-    response = await client.post(
+    response = await post_validate(client,
         ctx.url(run_id=other_run), json={"accepted_warning_ids": []}, headers=ctx.headers
     )
     assert response.status_code == 404
@@ -485,7 +486,7 @@ async def test_run_from_another_tenant_returns_404(client: AsyncClient, ctx: _Ct
 
 @pytest.mark.asyncio
 async def test_unauthenticated_request_is_rejected(client: AsyncClient, ctx: _Ctx) -> None:
-    response = await client.post(ctx.url(), json={"accepted_warning_ids": []})
+    response = await post_validate(client,ctx.url(), json={"accepted_warning_ids": []})
     assert response.status_code == 401
 
 
@@ -495,7 +496,7 @@ async def test_unauthenticated_request_is_rejected(client: AsyncClient, ctx: _Ct
 @pytest.mark.asyncio
 async def test_unscoped_validate_is_rejected(client: AsyncClient, ctx: _Ctx) -> None:
     await _add_upload(ctx, _workbook(_healthy_rows()))
-    response = await client.post(
+    response = await post_validate(client,
         ctx.url(scope=None), json={"accepted_warning_ids": []}, headers=ctx.headers
     )
     assert response.status_code == 400
@@ -505,7 +506,7 @@ async def test_unscoped_validate_is_rejected(client: AsyncClient, ctx: _Ctx) -> 
 @pytest.mark.asyncio
 async def test_lgd_scope_needs_an_lgd_upload(client: AsyncClient, ctx: _Ctx) -> None:
     await _add_upload(ctx, _workbook(_healthy_rows()))
-    response = await client.post(
+    response = await post_validate(client,
         ctx.url(scope="lgd"), json={"accepted_warning_ids": []}, headers=ctx.headers
     )
     assert response.status_code == 400
@@ -514,7 +515,7 @@ async def test_lgd_scope_needs_an_lgd_upload(client: AsyncClient, ctx: _Ctx) -> 
 
 async def test_preview_carries_the_term_structure(client: AsyncClient, ctx: _Ctx) -> None:
     await _add_upload(ctx, _workbook(_healthy_rows()))
-    response = await client.post(ctx.url(), json={"accepted_warning_ids": []}, headers=ctx.headers)
+    response = await post_validate(client,ctx.url(), json={"accepted_warning_ids": []}, headers=ctx.headers)
     assert response.status_code == 200
     segment = response.json()["data"]["pd_preview"]["segments"][0]
     assert len(segment["proportions"]) == 3 and len(segment["normalized"]) == 3
