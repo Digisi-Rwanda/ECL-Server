@@ -1,4 +1,4 @@
-from datetime import datetime
+from datetime import date, datetime
 from typing import Any, Literal
 
 from pydantic import BaseModel, Field
@@ -9,12 +9,16 @@ from app.engine.format_utils import format_file_size, short_ulid
 class CreateRunRequest(BaseModel):
     name: str = Field(min_length=1, max_length=200)
     reporting_period: str | None = Field(default=None, max_length=100)
+    # Spec 1.5: exposure rows with another Reporting Date are excluded.
+    # Null = use the EAD file's most common Reporting Date.
+    reporting_date: date | None = None
 
 
 class UpdateRunRequest(BaseModel):
     combine_pd_files: bool | None = None
     name: str | None = Field(default=None, min_length=1, max_length=200)
     reporting_period: str | None = Field(default=None, max_length=100)
+    reporting_date: date | None = None
 
 
 class RerunRequest(BaseModel):
@@ -29,28 +33,6 @@ class UploadOut(BaseModel):
     sha256: str
     sheet_count: int | None = None
     row_count: int | None = None
-
-
-class ValidationIssueOut(BaseModel):
-    id: str
-    kind: Literal["PD", "LGD", "EAD"]
-    level: Literal["warn", "block"]
-    title: str
-    location: str
-    fix: str
-    upload_id: str | None = None
-    filename: str | None = None
-    category: str | None = None
-
-
-class ValidationResultOut(BaseModel):
-    status: Literal["ok", "warn", "blocking"]
-    summary: str
-    sub_summary: str
-    issues: list[ValidationIssueOut]
-    detected_segments: list[str]
-    blocking_count: int = 0
-    warning_count: int = 0
 
 
 class ValidateRunRequest(BaseModel):
@@ -139,6 +121,7 @@ class SegmentBarOut(BaseModel):
 
 
 class RunDetailOut(RunListItemOut):
+    reportingDate: str | None = None
     elapsed: str | None = None
     kpis: list[KpiOut]
     segments: list[SegmentBarOut]
@@ -252,10 +235,6 @@ class UploadResponse(BaseModel):
     data: UploadOut
 
 
-class ValidationResponse(BaseModel):
-    data: ValidationResultOut
-
-
 class ExecuteRunResponse(BaseModel):
     data: ExecuteRunOut
 
@@ -292,3 +271,177 @@ def upload_to_input_file(
         warningCount=warning_count if warning_count else None,
         hash=hash_display(sha256),
     )
+
+
+# ── ECL spec v1.0 report pieces, shared by LGD/EAD validation and results ────
+
+
+class ReconciliationOut(BaseModel):
+    name: str
+    expected: float
+    actual: float
+    difference: float
+    passed: bool
+    detail: str
+
+
+class SummaryRowOut(BaseModel):
+    key: str
+    outstanding: float
+    ecl: float
+    # Fraction; the client formats it.
+    coverage: float
+
+
+class ExceptionOut(BaseModel):
+    category: str
+    dataset: str
+    loanId: str
+    customerId: str
+    field: str
+    value: str
+    issue: str
+    action: str
+
+
+class EclTotalsOut(BaseModel):
+    outstanding: float
+    ecl: float
+    eclBeforeCap: float
+    coverage: float
+    loans: int
+    excludedRows: int
+    cappedLoans: int
+
+
+class EclReportOut(BaseModel):
+    runId: str
+    reportingDate: str | None
+    specVersion: str
+    engineVersion: str
+    totals: EclTotalsOut
+    stageSummary: list[SummaryRowOut]
+    segmentSummary: list[SummaryRowOut]
+    reconciliation: list[ReconciliationOut]
+    exceptionCounts: dict[str, int]
+
+
+class EclReportResponse(BaseModel):
+    data: EclReportOut
+
+
+class ExceptionsPageOut(BaseModel):
+    items: list[ExceptionOut]
+    total: int
+    page: int
+    perPage: int
+
+
+class ExceptionsPageResponse(BaseModel):
+    data: ExceptionsPageOut
+
+
+# ── LGD / EAD validation (?scope=lgd, ?scope=ead) ────────────────────────────
+
+
+class CollateralParameterOut(BaseModel):
+    name: str
+    haircut: float | None
+    years: float | None
+    valid: bool
+
+
+class LgdLoanOut(BaseModel):
+    loanId: str
+    customerId: str
+    outstanding: float
+    totalCustomerExposure: float
+    proportion: float
+    collateralEir: float
+    # Per collateral type: [customer value, allocated, discounted]
+    collateral: dict[str, list[float]]
+    discountedCollateral: float
+
+
+class LgdPreviewOut(BaseModel):
+    provisional: bool
+    parameters: list[CollateralParameterOut]
+    loans: list[LgdLoanOut]
+    loanCount: int
+    exceptions: list[ExceptionOut]
+    exceptionCount: int
+
+
+class LgdValidationResultOut(BaseModel):
+    status: Literal["ok", "warn", "blocking"]
+    criteria: list[PdCriterionOut]
+    preview: LgdPreviewOut | None
+    engine_version: str
+
+
+class LgdValidationResponse(BaseModel):
+    data: LgdValidationResultOut
+
+
+class ExcludedLoanOut(BaseModel):
+    loanId: str
+    customerId: str
+    outstanding: float | None
+    reason: str
+
+
+class EadLoanOut(BaseModel):
+    loanId: str
+    customerId: str
+    segment: str
+    stage: str
+    treatment: str
+    outstanding: float
+    discountedCollateral: float
+    rows: int
+    eclBeforeCap: float
+    totalEcl: float
+    capped: bool
+
+
+class RowTableOut(BaseModel):
+    """Row Detail as columns + rows of values (compact for large books)."""
+
+    columns: list[str]
+    data: list[list[float | int | str | None]]
+
+
+class EadPreviewOut(BaseModel):
+    reportingDate: str | None
+    reportingDateSource: Literal["run", "file"]
+    loans: list[EadLoanOut]
+    loanCount: int
+    rows: RowTableOut
+    rowLoanCount: int
+    totals: EclTotalsOut
+    stageSummary: list[SummaryRowOut]
+    segmentSummary: list[SummaryRowOut]
+    reconciliation: list[ReconciliationOut]
+    exceptions: list[ExceptionOut]
+    exceptionCounts: dict[str, int]
+    excluded: list[ExcludedLoanOut]
+
+
+class EadValidationResultOut(BaseModel):
+    status: Literal["ok", "warn", "blocking"]
+    criteria: list[PdCriterionOut]
+    preview: EadPreviewOut | None
+    engine_version: str
+
+
+class EadValidationResponse(BaseModel):
+    data: EadValidationResultOut
+
+
+class AcceptReviewOut(BaseModel):
+    kind: Literal["PD", "LGD", "EAD"]
+    accepted: int
+
+
+class AcceptReviewResponse(BaseModel):
+    data: AcceptReviewOut

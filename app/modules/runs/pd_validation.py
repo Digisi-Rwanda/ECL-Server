@@ -3,11 +3,9 @@
 Async and DB-aware. Loads only the PD uploads, resolves tenant thresholds, hands
 everything to the pure engine, and maps the result onto the wire schema.
 
-Deliberately separate from `service.validate_files`, which requires PD, LGD and
-EAD together and evaluates cross-file consistency. PD-scoped validation exists
-so a reviewer can inspect PD on its own, before the other two files are even
-prepared, so it must not inherit that gate. Shared download/parse helpers are
-imported from `service` rather than duplicated.
+PD is the first of three validation steps (PD, then LGD, then EAD; see
+`ecl_validation`), so it never needs the other two files. Shared download and
+parse helpers are imported from `service` rather than duplicated.
 
 Nothing is persisted beyond the PD uploads' validation status and two audit
 events. Reproducibility comes from the inputs plus the engine version plus the

@@ -21,6 +21,7 @@ from sqlalchemy import select
 
 from app.core.run_enums import UploadKind, ValidationStatus
 from app.core.security import create_access_token, new_ulid
+from app.engine import ENGINE_VERSION
 from app.modules.audit.models import AuditEvent, AuditLog
 from app.modules.auth.models import User
 from app.modules.runs.models import PdValidationThresholds, Run, Upload
@@ -196,7 +197,7 @@ async def test_preview_payload_matches_the_engine(client: AsyncClient, ctx: _Ctx
     response = await client.post(ctx.url(), json={"accepted_warning_ids": []}, headers=ctx.headers)
     preview = response.json()["data"]["pd_preview"]
 
-    assert preview["engine_version"] == "v1.2.0"
+    assert preview["engine_version"] == ENGINE_VERSION
     assert len(preview["loans"]) == len(_healthy_rows())
 
     first = preview["loans"][0]
@@ -287,7 +288,7 @@ async def test_validation_writes_scoped_audit_events(client: AsyncClient, ctx: _
     )
     assert completed.details["scope"] == "pd"
     assert completed.details["status"] == "ok"
-    assert completed.details["engine_version"] == "v1.2.0"
+    assert completed.details["engine_version"] == ENGINE_VERSION
     assert completed.details["criteria_counts"]["block"] == 0
 
 
@@ -404,7 +405,7 @@ async def test_blocking_structural_data_returns_200_with_real_criteria(
     # Present but empty, so the client renders the failure rather than falling through.
     assert data["pd_preview"]["loans"] == []
     assert data["pd_preview"]["segments"] == []
-    assert data["pd_preview"]["engine_version"] == "v1.2.0"
+    assert data["pd_preview"]["engine_version"] == ENGINE_VERSION
 
     async with TestSessionLocal() as db:
         upload = (await db.execute(select(Upload))).scalars().one()
@@ -488,33 +489,27 @@ async def test_unauthenticated_request_is_rejected(client: AsyncClient, ctx: _Ct
     assert response.status_code == 401
 
 
-# ── Regression: the unscoped route is untouched ──────────────────────────────
+# ── One lane: there is no combined validate any more ─────────────────────────
 
 
 @pytest.mark.asyncio
-async def test_unscoped_validate_still_requires_all_three_kinds(
-    client: AsyncClient, ctx: _Ctx
-) -> None:
+async def test_unscoped_validate_is_rejected(client: AsyncClient, ctx: _Ctx) -> None:
     await _add_upload(ctx, _workbook(_healthy_rows()))
-
     response = await client.post(
         ctx.url(scope=None), json={"accepted_warning_ids": []}, headers=ctx.headers
     )
     assert response.status_code == 400
-    assert response.json()["code"] == "MISSING_UPLOADS"
+    assert response.json()["code"] == "INVALID_SCOPE"
 
 
 @pytest.mark.asyncio
-async def test_unrecognized_scope_falls_through_to_the_unscoped_path(
-    client: AsyncClient, ctx: _Ctx
-) -> None:
+async def test_lgd_scope_needs_an_lgd_upload(client: AsyncClient, ctx: _Ctx) -> None:
     await _add_upload(ctx, _workbook(_healthy_rows()))
-
     response = await client.post(
         ctx.url(scope="lgd"), json={"accepted_warning_ids": []}, headers=ctx.headers
     )
     assert response.status_code == 400
-    assert response.json()["code"] == "MISSING_UPLOADS"
+    assert response.json()["code"] == "NO_LGD_UPLOADS"
 
 
 async def test_preview_carries_the_term_structure(client: AsyncClient, ctx: _Ctx) -> None:

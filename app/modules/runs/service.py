@@ -6,12 +6,13 @@ import hashlib
 import io
 import zipfile
 from dataclasses import dataclass
-from datetime import UTC, datetime
+from datetime import UTC, datetime, timedelta
 from typing import Any
 from zoneinfo import ZoneInfo
 
 import pandas as pd
 from sqlalchemy import and_, delete, func, or_, select
+from sqlalchemy.exc import IntegrityError
 from sqlalchemy.ext.asyncio import AsyncSession
 
 from app.config import get_settings
@@ -35,24 +36,23 @@ from app.engine.format_utils import (
     map_run_status_to_api,
     short_ulid,
 )
-from app.engine.validators import validate_ead, validate_lgd, validate_pd
-from app.engine.validators.base import MAX_ISSUES, ValidationIssue
-from app.engine.validators.cross_file_validator import CrossFileData, validate_cross_files
+from app.engine.validators.base import ValidationIssue
 from app.modules.audit.models import AuditEvent
 from app.modules.audit.service import log_event
 from app.modules.auth.models import User
 from app.modules.auth.utils import user_initials
-from app.modules.collateral.models import CollateralType
 from app.modules.runs.models import Run, Upload
 from app.modules.tenants.models import TenantMembership
 
 
 import re as _re
-from decimal import Decimal as _Decimal
 
 from app.core.logging import get_logger
 
 log = get_logger("runs.service")
+
+
+_REDISPATCH_AFTER = timedelta(minutes=2)
 
 
 def _compute_has_started(progress: object) -> bool:
@@ -111,12 +111,6 @@ def _segment_code(name: str) -> str:
     return _re.sub(r"[^A-Z0-9_]", "_", name.strip().upper())[:20]
 
 
-def _extract_lgd_collateral_columns(df: pd.DataFrame) -> set[str]:
-    from app.engine.validators.lgd_validator import LGD_REQUIRED_COLUMNS, _EIR_ALIASES
-    known = set(LGD_REQUIRED_COLUMNS) | set(_EIR_ALIASES)
-    return {c for c in df.columns if c not in known}
-
-
 async def _auto_provision_segments(
     db: AsyncSession, tenant_id: str, user_id: str, names: set[str]
 ) -> None:
@@ -139,37 +133,14 @@ async def _auto_provision_segments(
     req = BatchCreateSegmentsRequest(segments=[
         CreateSegmentRequest(name=n, code=_segment_code(n)) for n in sorted(truly_new)
     ])
-    await batch_create_segments(db, tenant_id, user_id, req)
-
-
-async def _auto_provision_collateral(
-    db: AsyncSession, tenant_id: str, user_id: str, names: set[str]
-) -> None:
-    from app.modules.collateral.models import CollateralType
-    from app.modules.collateral.service import batch_create_collateral_types
-    from app.modules.collateral.schemas import BatchCreateCollateralTypesRequest, CreateCollateralTypeRequest
-
-    # Check including soft-deleted rows to avoid UniqueViolation on the (tenant_id, name) index
-    result = await db.execute(
-        select(CollateralType.name).where(
-            CollateralType.tenant_id == tenant_id,
-            CollateralType.name.in_(list(names)),
-        )
-    )
-    already_exist = {row[0] for row in result.all()}
-    truly_new = names - already_exist
-    if not truly_new:
-        return
-
-    req = BatchCreateCollateralTypesRequest(items=[
-        CreateCollateralTypeRequest(
-            name=n,
-            haircut=_Decimal(str(_collateral_default(n)["haircut"])),
-            time_to_realize=_collateral_default(n)["time_to_realize"],
-        )
-        for n in sorted(truly_new)
-    ])
-    await batch_create_collateral_types(db, tenant_id, user_id, req)
+    # A concurrent validation of the same files may insert these first. A
+    # savepoint keeps that unique-violation from aborting this request's session;
+    # either way the segments exist afterwards.
+    try:
+        async with db.begin_nested():
+            await batch_create_segments(db, tenant_id, user_id, req)
+    except IntegrityError:
+        log.info("segments_provisioned_concurrently", tenant_id=tenant_id, names=sorted(truly_new))
 
 
 def get_run_scope_filter(
@@ -227,9 +198,6 @@ from app.modules.runs.schemas import (
     SegmentBarOut,
     UpdateRunRequest,
     UploadOut,
-    ValidateRunRequest,
-    ValidationIssueOut,
-    ValidationResultOut,
     hash_display,
     upload_to_input_file,
 )
@@ -377,10 +345,12 @@ async def _get_run_for_update(db: AsyncSession, tenant_id: str, run_id: str) -> 
 async def _clear_run_results(db: AsyncSession, run_id: str, tenant_id: str) -> None:
     from app.modules.results.models import (
         EadResult,
+        EclLoanSummary,
         LgdResult,
         OutputArtifact,
         PdObservationSnapshot,
         PdResult,
+        RunException,
     )
 
     await db.execute(
@@ -395,9 +365,8 @@ async def _clear_run_results(db: AsyncSession, run_id: str, tenant_id: str) -> N
     await db.execute(
         delete(LgdResult).where(LgdResult.run_id == run_id, LgdResult.tenant_id == tenant_id)
     )
-    await db.execute(
-        delete(EadResult).where(EadResult.run_id == run_id, EadResult.tenant_id == tenant_id)
-    )
+    for model in (EadResult, EclLoanSummary, RunException):
+        await db.execute(delete(model).where(model.run_id == run_id, model.tenant_id == tenant_id))
     await db.execute(
         delete(OutputArtifact).where(
             OutputArtifact.run_id == run_id,
@@ -419,16 +388,6 @@ async def _allowed_segments(db: AsyncSession, tenant_id: str) -> set[str]:
         select(Segment.name).where(
             Segment.tenant_id == tenant_id,
             Segment.deleted_at.is_(None),
-        )
-    )
-    return {row[0] for row in result.all()}
-
-
-async def _allowed_collateral(db: AsyncSession, tenant_id: str) -> set[str]:
-    result = await db.execute(
-        select(CollateralType.name).where(
-            CollateralType.tenant_id == tenant_id,
-            CollateralType.deleted_at.is_(None),
         )
     )
     return {row[0] for row in result.all()}
@@ -485,86 +444,6 @@ async def _load_uploads(db: AsyncSession, run_id: str) -> list[Upload]:
         select(Upload).where(Upload.run_id == run_id).order_by(Upload.created_at)
     )
     return list(result.scalars().all())
-
-
-def _validation_status_from_issues(
-    issues: list[ValidationIssue], *, warnings_accepted: bool
-) -> str:
-    if any(i.level == "block" for i in issues):
-        return ValidationStatus.ERROR.value
-    if any(i.level == "warn" for i in issues) and not warnings_accepted:
-        return ValidationStatus.WARN.value
-    return ValidationStatus.OK.value
-
-
-def _issues_to_out(tagged_issues: list[TaggedValidationIssue]) -> list[ValidationIssueOut]:
-    return [
-        ValidationIssueOut(
-            id=_issue_id(tagged.issue),
-            kind=tagged.kind,  # type: ignore[arg-type]
-            level=tagged.issue.level,
-            title=tagged.issue.title,
-            location=tagged.issue.location,
-            fix=tagged.issue.fix,
-            upload_id=tagged.upload_id,
-            filename=tagged.filename,
-            category=tagged.issue.category,
-        )
-        for tagged in tagged_issues
-    ]
-
-
-def _validation_summaries(
-    overall_status: str,
-    all_issues: list[TaggedValidationIssue],
-    detected: list[str],
-) -> tuple[str, str, int, int]:
-    blocking_count = sum(1 for tagged in all_issues if tagged.issue.level == "block")
-    warning_count = sum(1 for tagged in all_issues if tagged.issue.level == "warn")
-
-    if overall_status == ValidationStatus.OK.value:
-        segment_note = (
-            f"{len(detected)} segment(s) detected"
-            if detected
-            else "No segments detected yet"
-        )
-        return (
-            "All checks passed",
-            f"{segment_note} · files are ready for computation",
-            blocking_count,
-            warning_count,
-        )
-
-    if overall_status == "blocking":
-        return (
-            "Validation errors found",
-            (
-                f"{blocking_count} blocking error(s) across your uploads"
-                + (f" · {warning_count} warning(s)" if warning_count else "")
-                + " — fix and re-upload to continue"
-            ),
-            blocking_count,
-            warning_count,
-        )
-
-    return (
-        "Validation warnings found",
-        (
-            f"{warning_count} warning(s) to review"
-            + (f" · {len(detected)} segment(s) detected" if detected else "")
-        ),
-        blocking_count,
-        warning_count,
-    )
-
-
-def _extract_segments(dfs: list[pd.DataFrame]) -> set[str]:
-    found: set[str] = set()
-    for df in dfs:
-        if "SEGMENT" in df.columns:
-            values = df["SEGMENT"].dropna().astype(str).str.strip()
-            found.update(v for v in values if v)
-    return found
 
 
 async def _audit_events_for_run(
@@ -643,13 +522,14 @@ def _build_kpis(run: Run, loan_count: int | None = None) -> list[KpiOut]:
 
 
 async def _segment_bars(db: AsyncSession, run_id: str, tenant_id: str) -> list[SegmentBarOut]:
-    from app.modules.results.models import EadResult
+    from app.modules.results.models import EclLoanSummary as S
 
+    # Capped loan-level Total ECL (spec Step 11), not the uncapped row sum.
     result = await db.execute(
-        select(EadResult.segment, func.sum(EadResult.discounted_ecl).label("ecl"))
-        .where(EadResult.run_id == run_id, EadResult.tenant_id == tenant_id)
-        .group_by(EadResult.segment)
-        .order_by(func.sum(EadResult.discounted_ecl).desc())
+        select(S.segment, func.sum(S.total_ecl).label("ecl"))
+        .where(S.run_id == run_id, S.tenant_id == tenant_id)
+        .group_by(S.segment)
+        .order_by(func.sum(S.total_ecl).desc())
         .limit(6)
     )
     return [
@@ -769,6 +649,7 @@ async def create_run(
         created_by_user_id=user_id,
         name=req.name.strip(),
         reporting_period=req.reporting_period.strip() if req.reporting_period else None,
+        reporting_date=req.reporting_date,
         status=RunStatus.DRAFT.value,
         engine_version=ENGINE_VERSION,
     )
@@ -799,14 +680,36 @@ async def update_run(
             "Run can only be updated while in draft or queued status.",
             409,
         )
-    if req.combine_pd_files is not None:
+    if req.combine_pd_files is not None and req.combine_pd_files != run.combine_pd_files:
         run.combine_pd_files = req.combine_pd_files
+        # LGD and EAD validation read the PD curve built from these files.
+        await reset_validation_from(db, run.id, UploadKind.LGD.value)
     if req.name is not None:
         run.name = req.name.strip()
     if req.reporting_period is not None:
         run.reporting_period = req.reporting_period.strip() or None
+    if "reporting_date" in req.model_fields_set and run.reporting_date != req.reporting_date:
+        run.reporting_date = req.reporting_date
+        # The date decides which exposure rows are excluded (spec 1.5).
+        await reset_validation_from(db, run.id, UploadKind.EAD.value)
     await db.flush()
     return await get_run(db, tenant_id, run_id)
+
+
+_VALIDATION_ORDER = (UploadKind.PD.value, UploadKind.LGD.value, UploadKind.EAD.value)
+
+
+async def reset_validation_from(db: AsyncSession, run_id: str, kind: str) -> None:
+    """A changed file invalidates its own validation and every later step's.
+
+    EAD validation reads the PD curve and the collateral file, and LGD reads PD
+    loan IDs, so a new PD file must send LGD and EAD back through validation.
+    """
+    later = _VALIDATION_ORDER[_VALIDATION_ORDER.index(kind):]
+    result = await db.execute(select(Upload).where(Upload.run_id == run_id, Upload.kind.in_(later)))
+    for upload in result.scalars().all():
+        upload.validation_status = None
+        upload.warnings_accepted = False
 
 
 async def upload_file(
@@ -884,6 +787,7 @@ async def upload_file(
     )
     db.add(upload)
     await db.flush()
+    await reset_validation_from(db, run_id, kind)
     await log_event(
         db,
         AuditEvent.FILE_UPLOADED.value,
@@ -931,279 +835,7 @@ async def delete_upload(
     await delete_object(upload.storage_path)
     await db.delete(upload)
     await db.flush()
-
-
-async def validate_files(
-    db: AsyncSession,
-    tenant_id: str,
-    run_id: str,
-    user_id: str,
-    req: ValidateRunRequest,
-    *,
-    ip: str | None = None,
-    user_agent: str | None = None,
-) -> ValidationResultOut:
-    log.info("validate_files_started", run_id=run_id, tenant_id=tenant_id, user_id=user_id)
-    await _get_run(db, tenant_id, run_id)
-    uploads = await _load_uploads(db, run_id)
-    if not uploads:
-        raise ECLException("NO_UPLOADS", "No files uploaded for this run.", 400)
-
-    kinds_present = {u.kind for u in uploads}
-    required_kinds = {UploadKind.PD.value, UploadKind.LGD.value, UploadKind.EAD.value}
-    if not required_kinds.issubset(kinds_present):
-        missing = ", ".join(sorted(required_kinds - kinds_present))
-        raise ECLException(
-            "MISSING_UPLOADS",
-            f"Upload PD, LGD, and EAD files before validating. Missing: {missing}.",
-            400,
-        )
-
-    log.info("validate_files_loading_uploads", run_id=run_id, upload_count=len(uploads), kinds=[u.kind for u in uploads])
-    await log_event(
-        db,
-        AuditEvent.VALIDATION_TRIGGERED.value,
-        user_id=user_id,
-        ip=ip,
-        user_agent=user_agent,
-        details={"run_id": run_id, "description": "Validation started"},
-    )
-
-    # Pre-scan: load all upload data once, extract segments and collateral columns
-    upload_data: dict[str, tuple[dict[str, pd.DataFrame], pd.DataFrame]] = {}
-    prescan_segments: set[str] = set()
-    prescan_collateral: set[str] = set()
-
-    for upload in uploads:
-        log.info("validate_downloading_upload", run_id=run_id, kind=upload.kind, filename=upload.original_filename)
-        content = await download_bytes(upload.storage_path)
-        sheets, _, _ = _parse_excel(content)
-        combined = _combine_sheets(sheets)
-        upload_data[upload.id] = (sheets, combined)
-        log.info("validate_upload_loaded", run_id=run_id, kind=upload.kind, sheets=len(sheets), rows=len(combined))
-
-        if upload.kind in (UploadKind.PD.value, UploadKind.EAD.value):
-            if "SEGMENT" in combined.columns:
-                prescan_segments.update(
-                    v for v in combined["SEGMENT"].dropna().astype(str).str.strip().unique() if v
-                )
-        elif upload.kind == UploadKind.LGD.value:
-            prescan_collateral.update(_extract_lgd_collateral_columns(combined))
-
-    log.info("validate_prescan_complete", run_id=run_id, segments_found=sorted(prescan_segments), collateral_found=sorted(prescan_collateral))
-
-    # Auto-provision any missing segments and collateral types
-    allowed_segments = await _allowed_segments(db, tenant_id)
-    allowed_collateral = await _allowed_collateral(db, tenant_id)
-
-    new_segments = prescan_segments - allowed_segments
-    if new_segments:
-        log.info("validate_auto_provisioning_segments", run_id=run_id, new_segments=sorted(new_segments))
-        try:
-            await _auto_provision_segments(db, tenant_id, user_id, new_segments)
-            allowed_segments |= new_segments
-            log.info("validate_segments_provisioned", run_id=run_id, count=len(new_segments))
-        except Exception as exc:
-            log.warning("auto_provision_segments_failed", tenant_id=tenant_id, error=str(exc))
-
-    new_collateral = prescan_collateral - allowed_collateral
-    if new_collateral:
-        log.info("validate_auto_provisioning_collateral", run_id=run_id, new_collateral=sorted(new_collateral))
-        try:
-            await _auto_provision_collateral(db, tenant_id, user_id, new_collateral)
-            allowed_collateral |= new_collateral
-            log.info("validate_collateral_provisioned", run_id=run_id, count=len(new_collateral))
-        except Exception as exc:
-            log.warning("auto_provision_collateral_failed", tenant_id=tenant_id, error=str(exc))
-
-    accepted_ids = set(req.accepted_warning_ids)
-
-    all_issues: list[TaggedValidationIssue] = []
-    segment_dfs: list[pd.DataFrame] = []
-    issue_cap_hit = False
-    pd_uploads: list[Upload] = []
-    lgd_upload: Upload | None = None
-    ead_upload: Upload | None = None
-    pd_combined_frames: list[pd.DataFrame] = []
-
-    for upload in uploads:
-        sheets, combined = upload_data[upload.id]
-        issues: list[ValidationIssue] = []
-        per_file_cap_hit = False
-
-        if upload.kind == UploadKind.PD.value:
-            pd_uploads.append(upload)
-            for sheet_name, df in sheets.items():
-                result = validate_pd(df, sheet_name=sheet_name, allowed_segments=allowed_segments)
-                issues.extend(result.issues)
-                if result.issue_cap_reached:
-                    per_file_cap_hit = True
-            segment_dfs.append(combined)
-            pd_combined_frames.append(combined)
-        elif upload.kind == UploadKind.LGD.value:
-            lgd_upload = upload
-            for sheet_name, df in sheets.items():
-                result = validate_lgd(
-                    df,
-                    sheet_name=sheet_name,
-                    allowed_collateral_types=allowed_collateral,
-                )
-                issues.extend(result.issues)
-                if result.issue_cap_reached:
-                    per_file_cap_hit = True
-        elif upload.kind == UploadKind.EAD.value:
-            ead_upload = upload
-            for sheet_name, df in sheets.items():
-                result = validate_ead(df, sheet_name=sheet_name, allowed_segments=allowed_segments)
-                issues.extend(result.issues)
-                if result.issue_cap_reached:
-                    per_file_cap_hit = True
-            segment_dfs.append(combined)
-
-        if per_file_cap_hit:
-            issue_cap_hit = True
-
-        upload_warnings_accepted = upload.warnings_accepted
-        if req.accepted_warning_ids:
-            upload_warning_ids = {_issue_id(i) for i in issues if i.level == "warn"}
-            if upload_warning_ids and upload_warning_ids.issubset(accepted_ids):
-                upload.warnings_accepted = True
-                upload_warnings_accepted = True
-            elif not any(i.level == "block" for i in issues):
-                warn_ids = {_issue_id(i) for i in issues if i.level == "warn"}
-                if warn_ids & accepted_ids:
-                    upload.warnings_accepted = True
-                    upload_warnings_accepted = True
-
-        upload.validation_status = _validation_status_from_issues(
-            issues, warnings_accepted=upload_warnings_accepted
-        )
-        all_issues.extend(
-            TaggedValidationIssue(
-                kind=upload.kind,
-                issue=issue,
-                upload_id=upload.id,
-                filename=upload.original_filename,
-            )
-            for issue in issues
-        )
-        log.info(
-            "validate_file_result",
-            run_id=run_id,
-            kind=upload.kind,
-            filename=upload.original_filename,
-            status=upload.validation_status,
-            issue_count=len(issues),
-            blocking=sum(1 for i in issues if i.level == "block"),
-            warnings=sum(1 for i in issues if i.level == "warn"),
-        )
-
-    if ead_upload and lgd_upload:
-        ead_combined = upload_data[ead_upload.id][1]
-        lgd_combined = upload_data[lgd_upload.id][1]
-        pd_combined = (
-            pd.concat(pd_combined_frames, ignore_index=True)
-            if pd_combined_frames
-            else pd.DataFrame()
-        )
-        cross_issues = validate_cross_files(
-            CrossFileData(
-                pd_combined=pd_combined,
-                lgd_combined=lgd_combined,
-                ead_combined=ead_combined,
-                ead_upload_id=ead_upload.id,
-                ead_filename=ead_upload.original_filename,
-                lgd_upload_id=lgd_upload.id,
-                lgd_filename=lgd_upload.original_filename,
-                pd_upload_id=pd_uploads[0].id if pd_uploads else None,
-                pd_filename=pd_uploads[0].original_filename if pd_uploads else None,
-            )
-        )
-        for issue in cross_issues:
-            target_upload = ead_upload if "EAD" in issue.title or "EC-08" in issue.title else lgd_upload
-            if "EIR" in issue.title:
-                target_upload = ead_upload
-            all_issues.append(
-                TaggedValidationIssue(
-                    kind=target_upload.kind,
-                    issue=issue,
-                    upload_id=target_upload.id,
-                    filename=target_upload.original_filename,
-                )
-            )
-            if issue.level == "block":
-                target_upload.validation_status = ValidationStatus.ERROR.value
-            elif (
-                issue.level == "warn"
-                and target_upload.validation_status == ValidationStatus.OK.value
-            ):
-                target_upload.validation_status = ValidationStatus.WARN.value
-
-    if issue_cap_hit and len(all_issues) >= MAX_ISSUES:
-        all_issues.append(
-            TaggedValidationIssue(
-                kind=UploadKind.PD.value,
-                issue=ValidationIssue(
-                    level="block",
-                    title="Additional errors were found but not shown",
-                    location="Summary",
-                    fix=f"Fix the errors above and re-validate. Up to {MAX_ISSUES} issues are shown per run.",
-                ),
-                upload_id=pd_uploads[0].id if pd_uploads else None,
-                filename=pd_uploads[0].original_filename if pd_uploads else None,
-            )
-        )
-
-    detected = sorted(_extract_segments(segment_dfs))
-    overall_status = ValidationStatus.OK.value
-    if any(tagged.issue.level == "block" for tagged in all_issues):
-        overall_status = "blocking"
-    elif any(tagged.issue.level == "warn" for tagged in all_issues):
-        unaccepted = [
-            tagged
-            for tagged in all_issues
-            if tagged.issue.level == "warn" and _issue_id(tagged.issue) not in accepted_ids
-        ]
-        if unaccepted and not all(u.warnings_accepted for u in uploads):
-            overall_status = ValidationStatus.WARN.value
-
-    await db.flush()
-    log.info(
-        "validate_files_complete",
-        run_id=run_id,
-        overall_status=overall_status,
-        total_issues=len(all_issues),
-        total_blocking=sum(1 for tagged in all_issues if tagged.issue.level == "block"),
-        total_warnings=sum(1 for tagged in all_issues if tagged.issue.level == "warn"),
-        detected_segments=detected,
-        segment_count=len(detected),
-    )
-    await log_event(
-        db,
-        AuditEvent.VALIDATION_COMPLETED.value,
-        user_id=user_id,
-        ip=ip,
-        user_agent=user_agent,
-        details={
-            "run_id": run_id,
-            "description": f"Validation {overall_status} · {len(detected)} segments detected",
-            "status": overall_status,
-        },
-    )
-    summary, sub_summary, blocking_count, warning_count = _validation_summaries(
-        overall_status,
-        all_issues,
-        detected,
-    )
-    return ValidationResultOut(
-        status=overall_status,
-        summary=summary,
-        sub_summary=sub_summary,
-        issues=_issues_to_out(all_issues),
-        detected_segments=detected,
-        blocking_count=blocking_count,
-        warning_count=warning_count,
-    )
+    await reset_validation_from(db, run_id, upload.kind)
 
 
 async def execute_run(
@@ -1219,7 +851,11 @@ async def execute_run(
     run = await _get_run_for_update(db, tenant_id, run_id)
     log.info("execute_run_current_status", run_id=run_id, status=run.status, engine_version=run.engine_version)
     if run.status in _ACTIVE_RUN_STATUSES:
-        if run.status == RunStatus.QUEUED.value and not _compute_has_started(run.engine_progress):
+        # Re-dispatch only a queue that has sat untouched (a lost dispatch). A
+        # second click or a retried request seconds later would otherwise start
+        # a parallel pipeline that collides with the first.
+        stuck = run.updated_at is not None and datetime.now(UTC) - run.updated_at > _REDISPATCH_AFTER
+        if run.status == RunStatus.QUEUED.value and not _compute_has_started(run.engine_progress) and stuck:
             log.info("execute_run_reddispatch_unstarted_queue", run_id=run_id)
             return ExecuteRunOut(run_id=run_id, status=run.status, dispatch_task=True)
         log.info("execute_run_already_active", run_id=run_id, status=run.status)
@@ -1343,6 +979,7 @@ async def get_run(
     if view == "progress":
         return RunDetailOut(
             **base.model_dump(),
+            reportingDate=run.reporting_date.isoformat() if run.reporting_date else None,
             elapsed=_format_elapsed(run.started_at, run.finished_at),
             kpis=_build_kpis(run, None),
             segments=[],
@@ -1375,6 +1012,7 @@ async def get_run(
 
     return RunDetailOut(
         **base.model_dump(),
+        reportingDate=run.reporting_date.isoformat() if run.reporting_date else None,
         elapsed=_format_elapsed(run.started_at, run.finished_at),
         kpis=_build_kpis(run, loan_count),
         segments=await _segment_bars(db, run_id, tenant_id)

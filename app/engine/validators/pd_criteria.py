@@ -3,8 +3,7 @@
 Pure, synchronous, DB-free. Thresholds arrive as a keyword-only dataclass so
 this module never imports a model or touches a session.
 
-Unlike `pd_validator`, which only ever emits blocking issues, every criterion
-here reports an outcome — including `pass`. A checklist that can only say
+Every criterion here reports an outcome — including `pass`. A checklist that can only say
 "something is wrong" cannot tell a reviewer that a check actually ran, and an
 unrun check silently reading as fine is the failure mode this module exists to
 prevent. Criteria that cannot be evaluated say so explicitly.

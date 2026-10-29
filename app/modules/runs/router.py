@@ -18,10 +18,13 @@ from app.dependencies import (
     require_tenant_member,
 )
 from app.modules.results import service as results_service
-from app.modules.runs import pd_validation, service
+from app.modules.runs import ecl_validation, pd_validation, service
 from app.modules.runs.schemas import (
+    AcceptReviewResponse,
     CreateRunRequest,
+    EadValidationResponse,
     ExecuteRunResponse,
+    LgdValidationResponse,
     PdValidationResponse,
     PresignedDownloadResponse,
     RerunRequest,
@@ -30,7 +33,6 @@ from app.modules.runs.schemas import (
     UpdateRunRequest,
     UploadResponse,
     ValidateRunRequest,
-    ValidationResponse,
 )
 from app.modules.tenants.models import TenantMembership
 from app.tasks.compute_tasks import (
@@ -150,53 +152,60 @@ async def validate_files_endpoint(
     user: CurrentUser,
     scope: str | None = Query(default=None),
     _a: TenantMembership = Depends(require_tenant_analyst_or_admin),
-) -> ValidationResponse | PdValidationResponse:
-    # ?scope=pd validates the PD uploads alone and returns the criteria
-    # checklist plus preview. Unscoped keeps the original all-three-files
-    # behaviour byte for byte.
-    if scope and scope.strip().lower() == "pd":
-        _log.info("pd_validation_requested", run_id=run_id, tenant_id=tenant_id, user_id=user.id)
-        pd_data = await pd_validation.validate_pd_files(
-            db,
-            tenant_id,
-            run_id,
-            user.id,
-            ip=get_client_ip(request.headers.get("X-Forwarded-For")),
-            user_agent=get_user_agent(request.headers.get("User-Agent")),
+) -> PdValidationResponse | LgdValidationResponse | EadValidationResponse:
+    # One lane: PD, then LGD, then EAD, each validated on its own. EAD's
+    # checklist includes the cross-file checks and the full ECL preview.
+    scope_key = (scope or "").strip().lower()
+    client = {
+        "ip": get_client_ip(request.headers.get("X-Forwarded-For")),
+        "user_agent": get_user_agent(request.headers.get("User-Agent")),
+    }
+    _log.info("validation_requested", run_id=run_id, tenant_id=tenant_id, user_id=user.id, scope=scope_key)
+    if scope_key == "pd":
+        return PdValidationResponse(
+            data=await pd_validation.validate_pd_files(db, tenant_id, run_id, user.id, **client)
         )
-        _log.info(
-            "pd_validation_complete",
-            run_id=run_id,
-            status=pd_data.status,
-            criteria_count=len(pd_data.criteria),
-            loan_rows=len(pd_data.pd_preview.loans),
+    if scope_key == "lgd":
+        return LgdValidationResponse(
+            data=await ecl_validation.validate_lgd_files(db, tenant_id, run_id, user.id, **client)
         )
-        return PdValidationResponse(data=pd_data)
+    if scope_key == "ead":
+        return EadValidationResponse(
+            data=await ecl_validation.validate_ead_files(db, tenant_id, run_id, user.id, **client)
+        )
+    raise ECLException("INVALID_SCOPE", "scope must be pd, lgd or ead.", 400)
 
-    _log.info(
-        "validation_requested",
-        run_id=run_id,
-        tenant_id=tenant_id,
-        user_id=user.id,
-        accepted_warning_count=len(body.accepted_warning_ids),
+
+@router.post("/{tenant_id}/runs/{run_id}/validation/{kind}/accept")
+async def accept_review_endpoint(
+    tenant_id: str,
+    run_id: str,
+    kind: str,
+    db: DbSession,
+    user: CurrentUser,
+    _a: TenantMembership = Depends(require_tenant_analyst_or_admin),
+) -> AcceptReviewResponse:
+    return AcceptReviewResponse(
+        data=await ecl_validation.accept_review(db, tenant_id, run_id, user.id, kind)
     )
-    data = await service.validate_files(
-        db,
-        tenant_id,
-        run_id,
-        user.id,
-        body,
-        ip=get_client_ip(request.headers.get("X-Forwarded-For")),
-        user_agent=get_user_agent(request.headers.get("User-Agent")),
+
+
+@router.get("/{tenant_id}/runs/{run_id}/ecl/preview-export")
+@limiter.limit("10/minute")
+async def ecl_preview_export_endpoint(
+    request: Request,
+    tenant_id: str,
+    run_id: str,
+    db: DbSession,
+    user: CurrentUser,
+    _m: TenantMembership = Depends(require_tenant_member),
+) -> Response:
+    content, filename = await ecl_validation.build_ecl_preview_export(db, tenant_id, run_id)
+    return Response(
+        content=content,
+        media_type="application/vnd.openxmlformats-officedocument.spreadsheetml.sheet",
+        headers={"Content-Disposition": f'attachment; filename="{filename}"'},
     )
-    _log.info(
-        "validation_complete",
-        run_id=run_id,
-        status=data.status,
-        issue_count=len(data.issues),
-        detected_segments=data.detected_segments,
-    )
-    return ValidationResponse(data=data)
 
 
 @router.post(
