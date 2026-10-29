@@ -44,6 +44,7 @@ from app.engine.pd_engine import (
 )
 
 DEST_LABELS = (*STAGES, OFFBOOKS)
+MAX_PREVIEW_LOANS_PER_SEGMENT = 200
 
 # Built explicitly rather than via strftime("%b"), which is locale-dependent.
 # Determinism is asserted by EC-18, so it has to hold on every host.
@@ -268,26 +269,28 @@ def build_pd_preview(joined: pd.DataFrame, *, engine_version: str) -> PdPreview:
     }
 
     frame = joined.sort_values(["SEGMENT", "Loan ID", "Reporting Month"], kind="mergesort")
+    # The table shows every month of up to MAX_PREVIEW_LOANS_PER_SEGMENT loans per
+    # segment; matrices and stats below always use every row. A million-row book
+    # would otherwise ship a million objects to the browser and the database.
+    ids = frame["Loan ID"].astype(str)
+    first_ids = frame.assign(_id=ids).drop_duplicates(["SEGMENT", "_id"])
+    keep_ids = first_ids.groupby("SEGMENT", sort=False).head(MAX_PREVIEW_LOANS_PER_SEGMENT)
+    frame = frame[(frame["SEGMENT"].astype(str) + "\x00" + ids).isin(
+        set(keep_ids["SEGMENT"].astype(str) + "\x00" + keep_ids["_id"])
+    )]
+    months = pd.DatetimeIndex(frame["Reporting Month"])
+    labels = [f"{_MONTH_ABBR[m - 1]} {y}" for m, y in zip(months.month, months.year, strict=True)]
+    keys = [f"{y:04d}-{m:02d}" for m, y in zip(months.month, months.year, strict=True)]
+    wire = {v: stage_to_wire(v) for v in pd.unique(pd.concat([frame["Staging"], frame["Next Month Staging"]]))}
+    final = frame["SEGMENT"].astype(str).map(final_month_by_segment)
+    is_final = (pd.Series(months, index=frame.index) == final).tolist()
     loans = [
-        PdLoanRow(
-            loan_id=str(loan_id),
-            segment=str(segment),
-            reporting_month=month_label(reporting_month),
-            reporting_month_key=month_key(reporting_month),
-            staging=stage_to_wire(staging),
-            next_staging=stage_to_wire(next_staging),
-            # The final month of a segment has no t+1, so every loan in it
-            # reads Offbooks. Flagged rather than dropped: a loan that only
-            # appears in that month would otherwise vanish from the preview.
-            is_final_month=reporting_month == final_month_by_segment.get(str(segment)),
-        )
-        for loan_id, segment, reporting_month, staging, next_staging in zip(
-            frame["Loan ID"].tolist(),
-            frame["SEGMENT"].tolist(),
-            [pd.Timestamp(m) for m in frame["Reporting Month"].tolist()],
-            frame["Staging"].tolist(),
-            frame["Next Month Staging"].tolist(),
-            strict=True,
+        # The final month of a segment has no t+1, so every loan in it reads
+        # Offbooks; flagged rather than dropped.
+        PdLoanRow(str(lid), str(seg), lab, key, wire[st], wire[nx], fin)
+        for lid, seg, lab, key, st, nx, fin in zip(
+            frame["Loan ID"].tolist(), frame["SEGMENT"].tolist(), labels, keys,
+            frame["Staging"].tolist(), frame["Next Month Staging"].tolist(), is_final, strict=True,
         )
     ]
 

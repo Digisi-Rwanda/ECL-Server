@@ -5,10 +5,9 @@ from __future__ import annotations
 import io
 from typing import Any
 
+import numpy as np
 import pandas as pd
-from openpyxl import Workbook
-from openpyxl.cell import WriteOnlyCell
-from openpyxl.styles import Font
+import xlsxwriter
 
 from app.engine.ead_engine import DISCOUNTED_COLLATERAL, ROW_COLUMNS
 from app.engine.ecl_pipeline import COVERAGE, SPEC_VERSION, EclRun
@@ -17,54 +16,72 @@ from app.engine.ecl_rules import CAT_CAP, CAT_INPUT, CAT_PD, CAT_RECON, LOAN_ID
 EXCEL_MAX_ROWS = 1_048_576
 LOAN_DETAIL_FILENAME = "ECL Loan Detail.xlsx"
 PORTFOLIO_FILENAME = "ECL Portfolio Summary.xlsx"
+EXCEPTION_COLUMNS = ["Category", "Dataset", "Loan ID", "Customer ID", "Field", "Value", "Issue", "Action Taken"]
+_SLICE_ROWS = 50_000
+_MONEY_COLUMNS = {"Outstanding Amount", DISCOUNTED_COLLATERAL, "ECL Before Cap", "Total ECL", "ECL"}
 
-_BOLD = Font(bold=True)
-_MONEY = "#,##0.00"
-_PCT = "0.00%"
-EXCEPTION_COLUMNS = [
-    "Category",
-    "Dataset",
-    "Loan ID",
-    "Customer ID",
-    "Field",
-    "Value",
-    "Issue",
-    "Action Taken",
-]
+
+class _Book:
+    """xlsxwriter in constant-memory mode: rows stream to disk as they are written,
+    so a multi-million-row Row Detail costs flat memory and seconds, not minutes."""
+
+    def __init__(self) -> None:
+        self.buffer = io.BytesIO()
+        self.wb = xlsxwriter.Workbook(
+            self.buffer,
+            {"constant_memory": True, "default_date_format": "yyyy-mm-dd", "nan_inf_to_errors": True},
+        )
+        self.bold = self.wb.add_format({"bold": True})
+        self.money = self.wb.add_format({"num_format": "#,##0.00"})
+        self.pct = self.wb.add_format({"num_format": "0.00%"})
+
+    def frame(self, title: str, df: pd.DataFrame, pct: set[str] = frozenset()) -> None:
+        ws = self.wb.add_worksheet(title)
+        ws.write_row(0, 0, list(df.columns), self.bold)
+        for j, col in enumerate(df.columns):
+            fmt = self.pct if col in pct else self.money if col in _MONEY_COLUMNS else None
+            ws.set_column(j, j, 18, fmt)
+        ws.freeze_panes(1, 0)
+        # Convert and write in slices so memory stays flat for million-row tabs.
+        for start in range(0, len(df), _SLICE_ROWS):
+            for i, row in enumerate(_rows(df.iloc[start : start + _SLICE_ROWS]), start=start + 1):
+                ws.write_row(i, 0, row)
+
+    def pairs(self, title: str, rows: list[tuple[str, Any]]) -> None:
+        ws = self.wb.add_worksheet(title)
+        ws.set_column(0, 0, 34)
+        ws.set_column(1, 1, 60)
+        for i, (label, value) in enumerate(rows):
+            ws.write(i, 0, label, self.bold)
+            fmt = self.money if label.startswith("Total") else None
+            if value is not None and value != "":
+                ws.write(i, 1, _value(value), fmt)
+
+    def bytes(self) -> bytes:
+        self.wb.close()
+        return self.buffer.getvalue()
 
 
 def _value(v: Any) -> Any:
     if v is None or (not isinstance(v, str) and pd.isna(v)):
         return None
     if isinstance(v, pd.Timestamp):
-        return v.date()
+        return v.to_pydatetime()
     return v.item() if hasattr(v, "item") else v
 
 
-def _header(ws, columns: list[str]) -> None:
-    cells = []
-    for name in columns:
-        c = WriteOnlyCell(ws, value=name)
-        c.font = _BOLD
-        cells.append(c)
-    ws.append(cells)
-
-
-def _append_frame(
-    ws, df: pd.DataFrame, money: set[str] = frozenset(), pct: set[str] = frozenset()
-) -> None:
-    _header(ws, list(df.columns))
-    fmts = [(_MONEY if c in money else _PCT if c in pct else None) for c in df.columns]
-    for row in df.itertuples(index=False, name=None):
-        out = []
-        for v, fmt in zip(row, fmts, strict=True):
-            if fmt is None:
-                out.append(_value(v))
-            else:
-                c = WriteOnlyCell(ws, value=_value(v))
-                c.number_format = fmt
-                out.append(c)
-        ws.append(out)
+def _rows(df: pd.DataFrame):
+    """Rows as plain Python values; NaN/NaT become empty cells."""
+    cols = []
+    for col in df.columns:
+        values = df[col]
+        if pd.api.types.is_datetime64_any_dtype(values):
+            cols.append(np.array([None if pd.isna(v) else v.to_pydatetime() for v in values], dtype=object))
+        else:
+            arr = values.to_numpy(dtype=object, copy=True)
+            arr[pd.isna(values).to_numpy()] = None
+            cols.append(arr)
+    return zip(*cols, strict=True) if cols else iter(())
 
 
 def run_details_rows(run: EclRun, meta: dict[str, Any]) -> list[tuple[str, Any]]:
@@ -103,17 +120,6 @@ def run_details_rows(run: EclRun, meta: dict[str, Any]) -> list[tuple[str, Any]]
     return rows
 
 
-def _write_run_details(wb: Workbook, run: EclRun, meta: dict[str, Any]) -> None:
-    ws = wb.create_sheet("Run Details")
-    for label, value in run_details_rows(run, meta):
-        c = WriteOnlyCell(ws, value=label)
-        c.font = _BOLD
-        v = WriteOnlyCell(ws, value=_value(value))
-        if label.startswith("Total"):
-            v.number_format = _MONEY
-        ws.append([c, v])
-
-
 def row_detail_frame(run: EclRun) -> pd.DataFrame:
     """Every column from Steps 1-10, one row per Loan ID and Snapshot Date."""
     step1 = run.lgd.drop(columns=["Customer ID", "Outstanding Amount", DISCOUNTED_COLLATERAL])
@@ -133,58 +139,37 @@ def exceptions_frame(run: EclRun) -> pd.DataFrame:
     )
 
 
-def build_loan_detail_workbook(
-    run: EclRun, meta: dict[str, Any], max_rows: int = EXCEL_MAX_ROWS
-) -> bytes:
-    wb = Workbook(write_only=True)
-    _write_run_details(wb, run, meta)
+def build_loan_detail_workbook(run: EclRun, meta: dict[str, Any], max_rows: int = EXCEL_MAX_ROWS) -> bytes:
+    book = _Book()
+    book.pairs("Run Details", run_details_rows(run, meta))
 
     detail = row_detail_frame(run)
     capacity = max_rows - 1  # header row repeats on every tab
-    tabs: list[list[pd.DataFrame]] = [[]]
-    used = 0
-    # Fill loan by loan; a loan never splits across tabs.
-    for _, loan_rows in detail.groupby(LOAN_ID, sort=False):
-        if used and used + len(loan_rows) > capacity:
-            tabs.append([])
+    # Fill loan by loan; a loan never splits across tabs (detail is sorted by loan).
+    sizes = detail.groupby(LOAN_ID, sort=False).size()
+    tab_starts, used = [0], 0
+    position = 0
+    for size in sizes:
+        if used and used + size > capacity:
+            tab_starts.append(position)
             used = 0
-        tabs[-1].append(loan_rows)
-        used += len(loan_rows)
-    for i, parts in enumerate(tabs):
-        ws = wb.create_sheet("Row Detail" if i == 0 else f"Row Detail {i + 1}")
-        frame = pd.concat(parts) if parts else detail.iloc[0:0]
-        _append_frame(ws, frame)
+        used += size
+        position += size
+    bounds = [*tab_starts, len(detail)]
+    for i in range(len(tab_starts)):
+        book.frame("Row Detail" if i == 0 else f"Row Detail {i + 1}", detail.iloc[bounds[i] : bounds[i + 1]])
 
-    ws = wb.create_sheet("Loan Summary")
-    _append_frame(
-        ws,
-        run.loan_summary,
-        money={"Outstanding Amount", DISCOUNTED_COLLATERAL, "ECL Before Cap", "Total ECL"},
-    )
-
-    ws = wb.create_sheet("Exception Report")
+    book.frame("Loan Summary", run.loan_summary)
     exceptions = exceptions_frame(run)
     if exceptions.empty:
-        _header(ws, EXCEPTION_COLUMNS)
-        ws.append(["No exceptions"])
-    else:
-        _append_frame(ws, exceptions)
-    return _to_bytes(wb)
+        exceptions = pd.DataFrame([["No exceptions", *[None] * 7]], columns=EXCEPTION_COLUMNS)
+    book.frame("Exception Report", exceptions)
+    return book.bytes()
 
 
 def build_portfolio_workbook(run: EclRun, meta: dict[str, Any]) -> bytes:
-    wb = Workbook(write_only=True)
-    _write_run_details(wb, run, meta)
-    for title, table in (
-        ("Stage Summary", run.stage_summary),
-        ("Segment Summary", run.segment_summary),
-    ):
-        ws = wb.create_sheet(title)
-        _append_frame(ws, table, money={"Outstanding Amount", "ECL"}, pct={COVERAGE})
-    return _to_bytes(wb)
-
-
-def _to_bytes(wb: Workbook) -> bytes:
-    buffer = io.BytesIO()
-    wb.save(buffer)
-    return buffer.getvalue()
+    book = _Book()
+    book.pairs("Run Details", run_details_rows(run, meta))
+    book.frame("Stage Summary", run.stage_summary, pct={COVERAGE})
+    book.frame("Segment Summary", run.segment_summary, pct={COVERAGE})
+    return book.bytes()

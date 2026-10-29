@@ -9,9 +9,11 @@ from __future__ import annotations
 
 import io
 import re
+from datetime import date, datetime
 from collections.abc import Callable, Iterable, Mapping
 
 import pandas as pd
+from python_calamine import CalamineWorkbook
 
 # Every header the engines read, in its canonical spelling. Files are matched
 # case-, space- and underscore-insensitively ("loan_id", "LOAN ID ", "Loan Id").
@@ -73,6 +75,10 @@ def _id(value: object) -> object:
     return str(value).strip()
 
 
+def _strip(value: object) -> object:
+    return value.strip() if isinstance(value, str) else value
+
+
 def _header_row(raw: pd.DataFrame) -> int | None:
     """First row (of the first few) holding a "Loan ID" header, else None."""
     for i in range(min(HEADER_SCAN_ROWS, len(raw))):
@@ -95,26 +101,48 @@ def tidy_sheet(raw: pd.DataFrame) -> pd.DataFrame:
     # Duplicate headers: keep the first, as Excel users expect.
     frame = frame.loc[:, ~frame.columns.duplicated()]
     frame = frame.dropna(how="all").reset_index(drop=True).infer_objects()
-    for col in STAGE_COLUMNS:
-        if col in frame.columns:
-            frame[col] = frame[col].map(_stage)
-    for col in ID_COLUMNS:
-        if col in frame.columns:
-            frame[col] = frame[col].map(_id).astype(object)
+    # Normalise via each column's distinct values, not per cell: a million-row
+    # sheet has only a handful of stages and a few thousand IDs.
     for col in frame.columns:
-        if frame[col].dtype == object and frame[col].map(lambda v: isinstance(v, str)).all():
-            frame[col] = frame[col].str.strip()
+        if col in STAGE_COLUMNS:
+            fn = _stage
+        elif col in ID_COLUMNS:
+            fn = _id
+        elif frame[col].dtype == object or pd.api.types.is_string_dtype(frame[col]):
+            fn = _strip
+        else:
+            continue
+        values = frame[col]
+        lookup = {v: fn(v) for v in pd.unique(values.dropna())}
+        frame[col] = values.map(lookup).astype(object).where(values.notna(), None)
+    # Excel dates arrive as Python date/datetime objects; give such columns a real
+    # datetime dtype (converted per distinct value).
+    for col in frame.columns:
+        values = frame[col]
+        if values.dtype != object:
+            continue
+        sample = values.dropna().head(50)
+        if len(sample) and all(isinstance(v, (date, datetime)) for v in sample):
+            lookup = {v: pd.Timestamp(v) for v in pd.unique(values.dropna()) if isinstance(v, (date, datetime))}
+            if len(lookup) == values.dropna().nunique():
+                frame[col] = pd.to_datetime(values.map(lookup))
     return frame
 
 
 def read_workbook_sheets(content: bytes) -> dict[str, pd.DataFrame]:
     """Parse an .xlsx blob into `{sheet_name: clean frame}`.
 
-    calamine (Rust) reads several times faster and with far less memory than
-    openpyxl, which matters on small servers and 25 MB uploads.
+    python-calamine (Rust) parses the file and hands back each sheet as plain
+    rows in one call; pandas' calamine adapter converts cell by cell in Python,
+    which is several times slower on million-row sheets.
     """
-    raw = pd.read_excel(io.BytesIO(content), sheet_name=None, engine="calamine", header=None)
-    return {name: tidy_sheet(frame) for name, frame in raw.items()}
+    workbook = CalamineWorkbook.from_filelike(io.BytesIO(content))
+    sheets: dict[str, pd.DataFrame] = {}
+    for name in workbook.sheet_names:
+        rows = workbook.get_sheet_by_name(name).to_python()
+        width = max((len(r) for r in rows), default=0)
+        sheets[name] = tidy_sheet(pd.DataFrame(rows, columns=range(width)) if rows else pd.DataFrame())
+    return sheets
 
 
 def concat_sheets(frames: Iterable[pd.DataFrame]) -> pd.DataFrame:

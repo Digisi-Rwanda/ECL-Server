@@ -158,47 +158,32 @@ def resolve_reporting_date(exposure: pd.DataFrame, run_date: date | None) -> pd.
 
 def _exposure_failures(
     df: pd.DataFrame, reporting_date: pd.Timestamp | None
-) -> list[list[tuple[str, object, str]]]:
-    """Per row: every failed rule as (field, value, issue)."""
-    dup = df[LOAN_ID].notna() & df[LOAN_ID].duplicated(keep=False)
-    out: list[list[tuple[str, object, str]]] = []
-    for i, row in df.iterrows():
-        fails: list[tuple[str, object, str]] = []
-        if dup.iat[i]:
-            fails.append((LOAN_ID, row[LOAN_ID], "Loan ID appears more than once"))
-        for col in EXPOSURE_FIELDS:
-            if pd.isna(row[col]):
-                fails.append((col, "", f"{col} is missing or not a valid value"))
-        stage = row[STAGE]
-        if not pd.isna(stage) and stage not in STAGES:
-            fails.append((STAGE, stage, 'Stage is not "Stage 1", "Stage 2" or "Stage 3"'))
-        amount = row[OUTSTANDING]
-        if not pd.isna(amount) and amount < 0:
-            fails.append((OUTSTANDING, amount, "Outstanding Amount is negative"))
-        rate = row[EIR]
-        if not pd.isna(rate) and (rate < 0 or rate > 1):
-            issue = (
-                "EIR is negative"
-                if rate < 0
-                else "EIR is above 1 (probably given as a percentage, not a decimal)"
-            )
-            fails.append((EIR, rate, issue))
-        rep, fp, mat = row[REPORTING_DATE], row[FIRST_PAYMENT_DATE], row[MATURITY_DATE]
-        if not pd.isna(fp) and not pd.isna(rep) and fp > rep:
-            fails.append((FIRST_PAYMENT_DATE, fp, "First Payment Date is after the Reporting Date"))
-        if not pd.isna(mat) and not pd.isna(fp) and mat < fp:
-            fails.append((MATURITY_DATE, mat, "Maturity Date is before the First Payment Date"))
-        if reporting_date is not None and not pd.isna(rep) and rep != reporting_date:
-            fails.append(
-                (
-                    REPORTING_DATE,
-                    rep,
-                    "Reporting Date differs from the run's Reporting Date "
-                    f"({reporting_date.date().isoformat()})",
-                )
-            )
-        out.append(fails)
-    return out
+) -> list[tuple[pd.Series, str, pd.Series, str]]:
+    """Every rule as (failing-rows mask, field, value column, issue), whole columns at once."""
+    rules: list[tuple[pd.Series, str, pd.Series, str]] = [
+        (df[LOAN_ID].notna() & df[LOAN_ID].duplicated(keep=False), LOAN_ID, df[LOAN_ID],
+         "Loan ID appears more than once"),
+    ]
+    blank = pd.Series("", index=df.index)
+    for col in EXPOSURE_FIELDS:
+        rules.append((df[col].isna(), col, blank, f"{col} is missing or not a valid value"))
+    stage, amount, rate = df[STAGE], df[OUTSTANDING], df[EIR]
+    rep, fp, mat = df[REPORTING_DATE], df[FIRST_PAYMENT_DATE], df[MATURITY_DATE]
+    rules += [
+        (stage.notna() & ~stage.isin(STAGES), STAGE, stage, 'Stage is not "Stage 1", "Stage 2" or "Stage 3"'),
+        (amount < 0, OUTSTANDING, amount, "Outstanding Amount is negative"),
+        (rate < 0, EIR, rate, "EIR is negative"),
+        (rate > 1, EIR, rate, "EIR is above 1 (probably given as a percentage, not a decimal)"),
+        (fp > rep, FIRST_PAYMENT_DATE, fp, "First Payment Date is after the Reporting Date"),
+        (mat < fp, MATURITY_DATE, mat, "Maturity Date is before the First Payment Date"),
+    ]
+    if reporting_date is not None:
+        rules.append((
+            rep.notna() & (rep != reporting_date), REPORTING_DATE, rep,
+            "Reporting Date differs from the run's Reporting Date "
+            f"({reporting_date.date().isoformat()})",
+        ))
+    return [(mask.fillna(False).astype(bool), fld, values, issue) for mask, fld, values, issue in rules]
 
 
 def _parameters(
@@ -267,24 +252,22 @@ def prepare_inputs(
     exposure = canonical_exposure(exposure_raw)
     reporting_date = resolve_reporting_date(exposure, run_reporting_date)
 
-    failures = _exposure_failures(exposure, reporting_date)
-    excluded_mask = pd.Series([bool(f) for f in failures], index=exposure.index, dtype=bool)
-    for i, fails in enumerate(failures):
-        row = exposure.iloc[i]
-        for fld, value, issue in fails:
-            exceptions.append(
-                ExceptionLine(
-                    CAT_INPUT,
-                    DS_EXPOSURE,
-                    _fmt(row[LOAN_ID]),
-                    _fmt(row[CUSTOMER_ID]),
-                    fld,
-                    _fmt(value),
-                    issue,
-                    "Loan excluded",
-                )
-            )
-    reasons = ["; ".join(issue for _, _, issue in f) for f in failures]
+    rules = _exposure_failures(exposure, reporting_date)
+    excluded_mask = pd.Series(False, index=exposure.index)
+    hits: list[tuple[int, int, ExceptionLine]] = []
+    reasons_by_row: dict[int, list[str]] = {}
+    for order, (mask, fld, values, issue) in enumerate(rules):
+        excluded_mask |= mask
+        for i in mask.index[mask]:
+            row = exposure.loc[i]
+            hits.append((i, order, ExceptionLine(
+                CAT_INPUT, DS_EXPOSURE, _fmt(row[LOAN_ID]), _fmt(row[CUSTOMER_ID]),
+                fld, _fmt(values.loc[i]), issue, "Loan excluded",
+            )))
+            reasons_by_row.setdefault(i, []).append(issue)
+    # Row order, then rule order: the Exception Report reads loan by loan.
+    exceptions.extend(line for _, _, line in sorted(hits, key=lambda h: (h[0], h[1])))
+    reasons = ["; ".join(reasons_by_row.get(i, [])) for i in exposure.index]
 
     raw_ids = set(exposure[LOAN_ID].dropna())
     included = exposure[~excluded_mask]

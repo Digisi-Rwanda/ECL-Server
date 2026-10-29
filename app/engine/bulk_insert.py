@@ -2,6 +2,7 @@
 
 from __future__ import annotations
 
+import re
 from datetime import date
 from decimal import Decimal
 from typing import Any
@@ -11,7 +12,8 @@ from sqlalchemy.ext.asyncio import AsyncConnection
 
 from app.core.security import new_ulid
 
-BATCH_SIZE = 5000
+BATCH_SIZE = 50_000
+_INSERT_SHAPE = re.compile(r"INSERT INTO (\w+) \(([^)]*)\)", re.S)
 
 _INSERT_PD = """
 INSERT INTO pd_results (
@@ -66,9 +68,13 @@ async def _executemany(conn: AsyncConnection, query: str, records: list[tuple[An
 
     raw = await conn.get_raw_connection()
     pg_conn = raw.driver_connection
+    # COPY is Postgres' bulk-load path: one round trip per batch instead of one
+    # statement per row, roughly 10x faster for hundreds of thousands of rows.
+    match = _INSERT_SHAPE.search(query)
+    table, columns = match.group(1), [c.strip() for c in match.group(2).split(",")]
     inserted = 0
     for batch in _chunks(records, BATCH_SIZE):
-        await pg_conn.executemany(query, batch)
+        await pg_conn.copy_records_to_table(table, records=batch, columns=columns)
         inserted += len(batch)
     return inserted
 
@@ -117,58 +123,50 @@ def _lgd_records(run_id: str, tenant_id: str, df: pd.DataFrame) -> list[tuple[An
     ]
 
 
-def _optional_decimal(value: Any) -> Decimal | None:
-    return None if value is None or pd.isna(value) else _to_decimal(value)
+def _num(df: pd.DataFrame, col: str) -> list[float]:
+    """Required numeric column as Python floats; a missing value is stored as 0."""
+    return pd.to_numeric(df[col], errors="coerce").fillna(0.0).astype(float).tolist()
 
 
+def _opt(df: pd.DataFrame, col: str) -> list[float | None]:
+    values = pd.to_numeric(df[col], errors="coerce").astype(object)
+    return values.where(values.notna(), None).tolist()
+
+
+def _text(df: pd.DataFrame, col: str) -> list[str]:
+    return df[col].astype(str).tolist()
+
+
+def _dates(df: pd.DataFrame, col: str) -> list[date]:
+    return pd.to_datetime(df[col]).dt.date.tolist()
+
+
+# Built column by column (no per-cell Decimal) and loaded with COPY, which
+# stores floats into NUMERIC columns at the column's scale.
 def _ead_records(run_id: str, tenant_id: str, df: pd.DataFrame) -> list[tuple[Any, ...]]:
-    return [
-        (
-            new_ulid(),
-            run_id,
-            tenant_id,
-            str(row["Loan ID"]),
-            str(row["Customer ID"]),
-            str(row["SEGMENT"]),
-            str(row["Stage"]),
-            _to_date(row["Snapshot Date"]),
-            int(row["Period Since Origination"]),
-            int(row["Period to Be Discounted"]),
-            _to_decimal(row["Monthly Instalment"]),
-            _to_decimal(row["Balance After Repayment"]),
-            _to_decimal(row["Balance After Missed Payment"]),
-            _optional_decimal(row["Marginal PD"]),
-            _optional_decimal(row["Cure Rate"]),
-            str(row["Treatment"]),
-            str(row["PD Rule"]),
-            _to_decimal(row["LGW"]),
-            _to_decimal(row["LGD"]),
-            _to_decimal(row["Credit Loss"]),
-            _to_decimal(row["Discounted ECL"]),
-        )
-        for row in df.to_dict(orient="records")
-    ]
+    n = len(df)
+    return list(zip(
+        [new_ulid() for _ in range(n)], [run_id] * n, [tenant_id] * n,
+        _text(df, "Loan ID"), _text(df, "Customer ID"), _text(df, "SEGMENT"), _text(df, "Stage"),
+        _dates(df, "Snapshot Date"),
+        df["Period Since Origination"].astype(int).tolist(), df["Period to Be Discounted"].astype(int).tolist(),
+        _num(df, "Monthly Instalment"), _num(df, "Balance After Repayment"), _num(df, "Balance After Missed Payment"),
+        _opt(df, "Marginal PD"), _opt(df, "Cure Rate"), _text(df, "Treatment"), _text(df, "PD Rule"),
+        _num(df, "LGW"), _num(df, "LGD"), _num(df, "Credit Loss"), _num(df, "Discounted ECL"),
+        strict=True,
+    ))
 
 
 def _loan_summary_records(run_id: str, tenant_id: str, df: pd.DataFrame) -> list[tuple[Any, ...]]:
-    return [
-        (
-            new_ulid(),
-            run_id,
-            tenant_id,
-            str(row["Loan ID"]),
-            str(row["Customer ID"]),
-            str(row["SEGMENT"]),
-            str(row["Stage"]),
-            _to_date(row["Reporting Date"]),
-            _to_decimal(row["Outstanding Amount"]),
-            _to_decimal(row["Discounted Collateral"]),
-            _to_decimal(row["ECL Before Cap"]),
-            row["ECL Capped"] == "Yes",
-            _to_decimal(row["Total ECL"]),
-        )
-        for row in df.to_dict(orient="records")
-    ]
+    n = len(df)
+    return list(zip(
+        [new_ulid() for _ in range(n)], [run_id] * n, [tenant_id] * n,
+        _text(df, "Loan ID"), _text(df, "Customer ID"), _text(df, "SEGMENT"), _text(df, "Stage"),
+        _dates(df, "Reporting Date"),
+        _num(df, "Outstanding Amount"), _num(df, "Discounted Collateral"), _num(df, "ECL Before Cap"),
+        (df["ECL Capped"] == "Yes").tolist(), _num(df, "Total ECL"),
+        strict=True,
+    ))
 
 
 async def bulk_insert_pd_results(
