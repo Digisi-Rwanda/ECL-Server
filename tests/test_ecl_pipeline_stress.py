@@ -8,8 +8,8 @@ from __future__ import annotations
 
 import pandas as pd
 
-from app.engine.ead_engine import compute_ead
-from app.engine.lgd_engine import compute_lgd
+from app.engine.ecl_pipeline import run_ecl
+from app.engine.ecl_rules import prepare_inputs
 from app.engine.pd_engine import compute_pd
 
 
@@ -76,10 +76,8 @@ def _ead_book() -> pd.DataFrame:
             "SEGMENT": ["Retail", "Retail", "Retail"],
             "Reporting Date": pd.to_datetime(["2024-12-31", "2024-12-31", "2024-12-31"]),
             "Maturity Date": pd.to_datetime(["2026-12-31", "2026-06-30", "2025-06-30"]),
-            "Adjusted Maturity Date": pd.to_datetime(["2026-12-31", "2026-06-30", "2025-06-30"]),
-            "First Payment Date": pd.to_datetime(["2024-12-31", "2024-12-31", "2024-12-31"]),
+            "First Payment Date": pd.to_datetime(["2024-01-31", "2024-01-31", "2024-01-31"]),
             "Outstanding Amount": [95_000.0, 76_000.0, 48_000.0],
-            "Repayment Frequency": ["MTH", "MTH", "MTH"],
             "Staging": ["Stage 1", "Stage 2", "Stage 3"],
             "Effective Interest Rate": [0.12, 0.14, 0.16],
         }
@@ -88,49 +86,28 @@ def _ead_book() -> pd.DataFrame:
 
 def test_ecl_pipeline_pd_lgd_ead_formula() -> None:
     pd_out, cure_rates, _ = compute_pd(_pd_book())
-    assert not pd_out.empty
     assert "Retail" in cure_rates
-    assert set(pd_out["SEGMENT"].unique()) == {"Retail"}
     assert pd_out["Marginal_PD"].between(0.0, 1.0).all()
 
-    lgd_out = compute_lgd(
-        _lgd_book(),
-        [{"name": "Property", "haircut": 0.15, "time_to_realize": 18}],
+    prepared = prepare_inputs(
+        _ead_book(), _lgd_book(), [{"name": "Property", "haircut": 0.15, "time_to_realize": 1.5}]
     )
-    assert len(lgd_out) == 3
-    collateral = lgd_out["Sum of Discounted Collaterals per Loan ID"].astype(float)
-    assert (collateral >= 0).all()
-    # Shared Property on CU-1 is split 95:76, not copied onto both loans.
-    cu1 = lgd_out[lgd_out["Customer ID"] == "CU-1"]
-    assert abs(float(cu1["Proportion"].sum()) - 1.0) < 1e-9
+    run = run_ecl(prepared, pd_out)
+    rows = run.rows
+    assert rows["Loan ID"].nunique() == 3
+    assert run.reconciliation_passed
 
-    ead_out, warnings = compute_ead(_ead_book(), pd_out, lgd_out)
-    assert not ead_out.empty
-    assert ead_out["Loan ID"].nunique() == 3
-    assert all("EC-08" not in w for w in warnings)
+    ead = rows["Balance After Missed Payment"]
+    # Core IFRS 9 identity: Credit Loss_t = EAD_t x PD_t x LGD_t
+    assert ((rows["Credit Loss"] - ead * rows["Marginal PD"] * rows["LGD"]).abs() < 1e-6).all()
+    assert rows["LGD"].between(0.0, 1.0).all()
+    assert run.total_ecl > 0
 
-    ead = ead_out["Balance After Missed Payment"].astype(float)
-    pd_t = ead_out["Marginal PD"].astype(float)
-    lgd_t = ead_out["LGD"].astype(float)
-    credit = ead_out["Credit Loss"].astype(float)
-    discounted = ead_out["Discounted ECL"].astype(float)
+    # Stage 3 is in default: PD 100% on its single, undiscounted row.
+    stage3 = rows[rows["Stage"] == "Stage 3"]
+    assert len(stage3) == 1 and stage3["Marginal PD"].iloc[0] == 1.0
+    assert stage3["Discounted ECL"].iloc[0] == stage3["Credit Loss"].iloc[0]
 
-    assert (pd_t.between(0.0, 1.0)).all()
-    assert (lgd_t.between(0.0, 1.0)).all()
-    assert (ead >= 0).all()
-    # Core IFRS 9 identity: Credit Loss_t = EAD_t × PD_t × LGD_t
-    assert ((credit - ead * pd_t * lgd_t).abs() < 1e-6).all()
-    assert (discounted >= 0).all()
-    assert discounted.sum() > 0
-
-    # Stage 3 is not time-discounted (discount factor = 1).
-    stage3 = ead_out[ead_out["Staging"] == "Stage 3"]
-    assert not stage3.empty
-    assert (
-        (stage3["Discounted ECL"].astype(float) - stage3["Credit Loss"].astype(float)).abs()
-        < 1e-6
-    ).all()
-
-    # Stage 1 uses a 12-month horizon (≤ 13 snapshots including t0).
-    stage1 = ead_out[ead_out["Loan ID"] == "LN-S1"]
-    assert 1 <= len(stage1) <= 13
+    # Stage 1: reporting row + 12 months, the reporting row carries no PD.
+    stage1 = rows[rows["Loan ID"] == "LN-S1"]
+    assert len(stage1) == 13 and stage1["Marginal PD"].iloc[0] == 0.0

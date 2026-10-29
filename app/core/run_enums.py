@@ -29,6 +29,9 @@ class OutputArtifactKind(StrEnum):
     LGD = "LGD"
     RUNDOWN = "RUNDOWN"
     ECL_SUMMARY = "ECL_SUMMARY"
+    # Spec v1.0 Step 11 workbooks; the three above stay downloadable on older runs.
+    LOAN_DETAIL = "LOAN_DETAIL"
+    PORTFOLIO_SUMMARY = "PORTFOLIO_SUMMARY"
 
 
 class EngineStageStatus(StrEnum):

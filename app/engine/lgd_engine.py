@@ -1,104 +1,77 @@
-"""LGD (Loss Given Default) computation engine."""
+"""Step 1 – Discounted Collateral per Loan (spec v1.0, section 2).
 
-# ECL formula context: Expected Credit Loss = EAD x PD x LGD (see ead_engine.py).
-# This module computes the discounted collateral value backing each loan.
-# ead_engine.py later turns that into the "LGD" term via:
-#   LGD = max(1 - collateral / EAD, 0) x (1 - cure_rate)
+ECL = EAD x Marginal PD x LGD. This module produces the collateral side of
+LGD; ead_engine turns it into LGD = max(0, 1 - Collateral / EAD) x (1 - Cure).
+Inputs must already have passed `ecl_rules.prepare_inputs`.
+"""
 
 from __future__ import annotations
 
-from decimal import Decimal
-from typing import Any
-
 import pandas as pd
 
-_EIR_ALIASES = ("Effective Interest Rate (EIR)", "Effective Interest Rate", "EIR")
-_SUM_COL = "Sum of Discounted Collaterals per Loan ID"
+from app.engine.ecl_rules import CUSTOMER_ID, LOAN_ID, OUTSTANDING, PreparedInputs
+
+TOTAL_CUSTOMER_EXPOSURE = "Total Customer Exposure"
+LOAN_PROPORTION = "Loan Proportion"
+DISCOUNTED_COLLATERAL = "Discounted Collateral"
+COLLATERAL_EIR = "Collateral EIR"
 
 
-def _resolve_eir_column(df: pd.DataFrame) -> str:
-    for name in _EIR_ALIASES:
-        if name in df.columns:
-            return name
-    return "Effective Interest Rate (EIR)"
+def allocated_col(collateral_type: str) -> str:
+    return f"Allocated {collateral_type}"
 
 
-def _to_decimal(value: float | int | Decimal) -> Decimal:
-    return Decimal(str(value))
+def discounted_col(collateral_type: str) -> str:
+    return f"Discounted {collateral_type}"
 
 
-def compute_lgd(df: pd.DataFrame, collateral_config: list[dict[str, Any]]) -> pd.DataFrame:
-    """Run the 5-step LGD computation pipeline."""
-    working = df.copy()
-    eir_col = _resolve_eir_column(working)
-    if eir_col != "EIR":
-        working = working.rename(columns={eir_col: "EIR"})
+def discount_factor(haircut: float, eir: pd.Series, years: float) -> pd.Series:
+    # (1 - Haircut) x (1 + EIR)^(-Time to Realization): forced-sale haircut, then
+    # present value over the years it takes to realise, at the loan's annual EIR.
+    return (1.0 - haircut) * (1.0 + eir) ** (-years)
 
-    working = working.sort_values(["Customer ID", "Loan ID"], kind="mergesort").reset_index(drop=True)
 
-    config_by_name = {item["name"]: item for item in collateral_config}
-    collateral_names = sorted(config_by_name.keys(), key=str)
+def compute_lgd(prepared: PreparedInputs) -> pd.DataFrame:
+    """One row per included loan with every Step 1 column, sorted by Loan ID."""
+    working = prepared.exposure[[LOAN_ID, CUSTOMER_ID, OUTSTANDING]].copy()
 
-    # Step 1 — total loan amount per customer.
-    # Math: T_c = sum(Outstanding Amount) across every loan of customer c
-    customer_totals = (
-        working.groupby("Customer ID", sort=True)["Outstanding Amount"]
-        .sum()
-        .rename("Total Loan Amount per Customer")
-    )
-    working = working.merge(customer_totals, on="Customer ID", how="left")
+    # Total Customer Exposure = SUM(Outstanding Amount) GROUP BY Customer ID, over the
+    # Exposure Dataset, so loans with no collateral row still count.
+    working[TOTAL_CUSTOMER_EXPOSURE] = working.groupby(CUSTOMER_ID)[OUTSTANDING].transform("sum")
+    # Loan Proportion = Outstanding Amount / Total Customer Exposure (0 when the total is 0).
+    total = working[TOTAL_CUSTOMER_EXPOSURE]
+    working[LOAN_PROPORTION] = (working[OUTSTANDING] / total.where(total != 0)).fillna(0.0)
 
-    # Step 2 — proportion.
-    # Math: w_l = Outstanding Amount_l / T_c
-    # This loan's share of the customer's total debt (0 if T_c == 0).
-    working["Proportion"] = working["Outstanding Amount"] / working[
-        "Total Loan Amount per Customer"
-    ].replace(0, pd.NA)
-    working["Proportion"] = working["Proportion"].fillna(0.0)
+    coll = prepared.collateral.drop(columns=[CUSTOMER_ID])
+    working = working.merge(coll, on=LOAN_ID, how="left")
+    has_row = working[COLLATERAL_EIR].notna()
+    working[COLLATERAL_EIR] = working[COLLATERAL_EIR].fillna(0.0)
 
-    discounted_sum = pd.Series(0.0, index=working.index, dtype="float64")
+    discounted_total = pd.Series(0.0, index=working.index)
+    for t in prepared.collateral_types:
+        # Step 2: a loan with no collateral record has collateral 0.
+        working[t] = working[t].where(has_row, 0.0).fillna(0.0)
+        # Allocated Collateral[type] = Loan Proportion x Collateral[type]
+        working[allocated_col(t)] = working[LOAN_PROPORTION] * working[t]
+        params = prepared.parameters.get(t)
+        if params is None:
+            working[discounted_col(t)] = 0.0
+        else:
+            working[discounted_col(t)] = working[allocated_col(t)] * discount_factor(
+                params["haircut"], working[COLLATERAL_EIR], params["time_to_realize"]
+            )
+        discounted_total += working[discounted_col(t)]
+    working[DISCOUNTED_COLLATERAL] = discounted_total
 
-    for collateral_name in collateral_names:
-        cfg = config_by_name[collateral_name]
-        haircut = float(cfg["haircut"])
-        time_to_realize = int(cfg["time_to_realize"])
-
-        if collateral_name not in working.columns:
-            working[collateral_name] = 0.0
-
-        proportional_col = f"Proportional {collateral_name}"
-        discounted_col = f"Discounted {collateral_name}"
-
-        # Step 3 — proportional collateral.
-        # Math: ProportionalCollateral_{l,k} = w_l x CollateralValue_{c,k}
-        # Splits a customer's shared collateral of type k across their loans
-        # in proportion to each loan's share of the total debt.
-        working[proportional_col] = working["Proportion"] * working[collateral_name].fillna(0.0)
-
-        # Step 4 — haircut and time discount.
-        # Math: DiscountFactor_k = (1 - haircut_k) x (1 + EIR)^(-time_to_realize_k)
-        # Standard collateral valuation: a haircut for forced-sale risk, then
-        # a present-value time discount (PV = FV / (1+r)^n) for however long
-        # repossession/realization is expected to take.
-        discount_factor = (1.0 - haircut) * (1.0 + working["EIR"]) ** (-time_to_realize)
-        # Math: DiscountedCollateral_{l,k} = ProportionalCollateral_{l,k} x DiscountFactor_k
-        working[discounted_col] = working[proportional_col] * discount_factor
-        discounted_sum += working[discounted_col]
-
-    # Step 5 — sum discounted collaterals per loan.
-    # Math: TotalDiscountedCollateral_l = sum_k(DiscountedCollateral_{l,k})
-    working[_SUM_COL] = discounted_sum.apply(_to_decimal)
-
-    output_cols = [
-        "Loan ID",
-        "Customer ID",
-        "Outstanding Amount",
-        "EIR",
-        "Total Loan Amount per Customer",
-        "Proportion",
-        _SUM_COL,
+    columns = [
+        LOAN_ID,
+        CUSTOMER_ID,
+        OUTSTANDING,
+        COLLATERAL_EIR,
+        TOTAL_CUSTOMER_EXPOSURE,
+        LOAN_PROPORTION,
     ]
-    for collateral_name in collateral_names:
-        output_cols.extend([f"Proportional {collateral_name}", f"Discounted {collateral_name}"])
-
-    return working[output_cols].sort_values(["Loan ID"], kind="mergesort").reset_index(drop=True)
+    for t in prepared.collateral_types:
+        columns += [t, allocated_col(t), discounted_col(t)]
+    columns.append(DISCOUNTED_COLLATERAL)
+    return working[columns].sort_values(LOAN_ID, kind="mergesort").reset_index(drop=True)

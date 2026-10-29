@@ -6,11 +6,19 @@
 # while pd_engine.compute_pd performs 300 powers and makes only Stage 3 absorbing.
 # v1.2.0 implements the "Lifetime PD Term Structure" spec: 299 powers, Stage 1's
 # 1 -> 3 share folded into Stage 2, and marginal PD 0 once S3 has saturated.
-ENGINE_VERSION = "v1.2.0"
-ENGINE_RELEASED_DATE = "2026-10-27"
+# v1.3.0 implements "ECL Calculation Specification" v1.0 for LGD, EAD and ECL
+# (input rules, Stage 3 PD = 100%, missed payments, cap, reconciliation).
+ENGINE_VERSION = "v1.3.0"
+ENGINE_RELEASED_DATE = "2026-10-29"
 PD_METHOD = (
     "Transition matrix with 299 monthly powers, Stage 1 -> 3 folded into Stage 2, "
     "Stage 3 absorbing"
 )
-LGD_METHOD = "Proportional collateral allocation with haircut and time discount"
-EAD_METHOD = "IFRS 9 stage-based snapshot rundown with missed payment compounding"
+LGD_METHOD = (
+    "Customer collateral split by exposure share, (1 - haircut) x (1 + EIR)^-years; "
+    "LGD = max(0, 1 - collateral / EAD) x (1 - cure rate)"
+)
+EAD_METHOD = (
+    "Stage 1 12 months, Stage 2 to maturity, Stage 3/matured/zero-rate single row; "
+    "level instalment; EAD = balance compounded over up to 3 missed payments"
+)

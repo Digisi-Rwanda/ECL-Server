@@ -124,8 +124,12 @@ async def _atomic_stage_update(
     ]
     params: dict[str, Any] = {"run_id": run_id, "stage_data": _json.dumps(stage_data)}
     for col, val in run_values.items():
-        set_clauses.append(f"{col} = :{col}")
-        params[col] = val
+        if isinstance(val, (list, dict)):
+            set_clauses.append(f"{col} = CAST(:{col} AS json)")
+            params[col] = _json.dumps(val)
+        else:
+            set_clauses.append(f"{col} = :{col}")
+            params[col] = val
 
     sql = f"UPDATE runs SET {', '.join(set_clauses)} WHERE id = :run_id"
     await db.execute(text(sql), params)
@@ -256,109 +260,27 @@ async def _input_hashes(db, run_id: str) -> str:
 
 
 async def _load_collateral_config(db, tenant_id: str) -> list[dict[str, Any]]:
-    from app.modules.collateral.models import CollateralType
+    from app.modules.runs.ecl_validation import collateral_parameters
 
-    result = await db.execute(
-        select(CollateralType).where(
-            CollateralType.tenant_id == tenant_id,
-            CollateralType.deleted_at.is_(None),
-        )
-    )
-    return [
-        {
-            "name": row.name,
-            "haircut": float(row.haircut) / 100.0,
-            "time_to_realize": row.time_to_realize,
-        }
-        for row in result.scalars().all()
-    ]
+    return await collateral_parameters(db, tenant_id)
 
 
-async def _load_pd_dataframe(db, run_id: str) -> pd.DataFrame:
-    from app.modules.results.models import PdResult
+async def _prepare_ecl_inputs(db, run):
+    """Download EAD + LGD, apply the spec input rules. Shared by the LGD and ECL stages."""
+    from app.core.run_enums import UploadKind
+    from app.engine.ecl_rules import is_collateral_sheet, is_exposure_sheet, prepare_inputs
 
-    result = await db.execute(select(PdResult).where(PdResult.run_id == run_id))
-    rows = result.scalars().all()
-    if not rows:
-        return pd.DataFrame(
-            columns=[
-                "SEGMENT",
-                "Month",
-                "Transition",
-                "Marginal_PD",
-                "Cure_Rate",
-                "Stage_1_prob",
-                "Stage_2_prob",
-                "Stage_3_prob",
-            ]
-        )
-    return pd.DataFrame(
-        [
-            {
-                "SEGMENT": row.segment,
-                "Month": row.month,
-                "Transition": row.transition,
-                "Marginal_PD": float(row.marginal_pd),
-                "Cure_Rate": float(row.cure_rate),
-                "Stage_1_prob": float(row.s1_prob),
-                "Stage_2_prob": float(row.s2_prob),
-                "Stage_3_prob": float(row.s3_prob),
-            }
-            for row in rows
-        ]
-    )
-
-
-async def _load_lgd_dataframe(db, run_id: str) -> pd.DataFrame:
-    from app.modules.results.models import LgdResult
-
-    result = await db.execute(select(LgdResult).where(LgdResult.run_id == run_id))
-    rows = result.scalars().all()
-    if not rows:
-        return pd.DataFrame(columns=["Loan ID", "Customer ID", "EIR", "Sum of Discounted Collaterals per Loan ID"])
-    return pd.DataFrame(
-        [
-            {
-                "Loan ID": row.loan_id,
-                "Customer ID": row.customer_id,
-                "EIR": float(row.eir),
-                "Sum of Discounted Collaterals per Loan ID": row.sum_discounted_collat,
-            }
-            for row in rows
-        ]
-    )
-
-
-async def _compute_run_totals(conn, run_id: str) -> tuple[Decimal, Decimal, Decimal]:
-    total_ecl_result = await conn.execute(
-        text(
-            """
-            SELECT COALESCE(SUM(discounted_ecl), 0) AS total_ecl
-            FROM ead_results
-            WHERE run_id = :run_id
-            """
-        ),
-        {"run_id": run_id},
-    )
-    total_ecl = Decimal(str(total_ecl_result.scalar_one()))
-
-    outstanding_result = await conn.execute(
-        text(
-            """
-            SELECT COALESCE(SUM(max_bal), 0) AS total_outstanding
-            FROM (
-                SELECT MAX(bal_after_missed) AS max_bal
-                FROM ead_results
-                WHERE run_id = :run_id
-                GROUP BY loan_id
-            ) loan_balances
-            """
-        ),
-        {"run_id": run_id},
-    )
-    total_outstanding = Decimal(str(outstanding_result.scalar_one()))
-    coverage = (total_ecl / total_outstanding) if total_outstanding > 0 else Decimal("0")
-    return total_ecl, total_outstanding, coverage
+    ead_uploads = await _load_uploads(db, run.id, UploadKind.EAD.value)
+    lgd_uploads = await _load_uploads(db, run.id, UploadKind.LGD.value)
+    if not ead_uploads:
+        raise ValueError("No EAD uploads found for run")
+    if not lgd_uploads:
+        raise ValueError("No LGD uploads found for run")
+    exposure = _combine_excel_bytes(await _download_uploads(ead_uploads), keep_sheet=is_exposure_sheet)
+    collateral = _combine_excel_bytes(await _download_uploads(lgd_uploads), keep_sheet=is_collateral_sheet)
+    config = await _load_collateral_config(db, run.tenant_id)
+    prepared = prepare_inputs(exposure, collateral, config, run.reporting_date)
+    return prepared, ead_uploads, lgd_uploads, config
 
 
 async def _upload_workbooks(
@@ -546,30 +468,21 @@ async def _lgd_main(run_id: str) -> dict[str, str]:
         _log.info("compute_stage_started", run_id=run_id, stage="lgd", pct=0)
 
         try:
-            _log.info("lgd_loading_uploads", run_id=run_id, pct=5)
-            uploads = await _load_uploads(db, run_id, UploadKind.LGD.value)
-            if not uploads:
-                msg = "No LGD uploads found for run"
-                raise ValueError(msg)
-            _log.info("lgd_uploads_found", run_id=run_id, file_count=len(uploads), filenames=[u.original_filename for u in uploads], pct=10)
-
-            _log.info("lgd_downloading_files", run_id=run_id, pct=15)
-            files = await _download_uploads(uploads)
-            total_bytes = sum(len(f) for f in files)
-            _log.info("lgd_files_downloaded", run_id=run_id, file_count=len(files), total_bytes=total_bytes, pct=20)
-
-            _log.info("lgd_loading_collateral_config", run_id=run_id, pct=25)
-            collateral_config = await _load_collateral_config(db, run.tenant_id)
-            _log.info("lgd_collateral_config_loaded", run_id=run_id, collateral_type_count=len(collateral_config), types=[c["name"] for c in collateral_config], pct=30)
-
-            _log.info("lgd_combining_sheets", run_id=run_id, pct=35)
-            lgd_input = _combine_excel_bytes(files)
-            del files
-            gc.collect()
-            _log.info("lgd_data_combined", run_id=run_id, row_count=len(lgd_input), pct=40)
-
-            _log.info("lgd_computing_discounted_collateral", run_id=run_id, loan_count=len(lgd_input), pct=45)
-            lgd_output = compute_lgd(lgd_input, collateral_config)
+            _log.info("lgd_loading_inputs", run_id=run_id, pct=5)
+            # Step 1 needs Total Customer Exposure from the Exposure (EAD) file,
+            # so LGD reads both files and applies the same input rules as ECL.
+            prepared, _ead_uploads, lgd_uploads, collateral_config = await _prepare_ecl_inputs(db, run)
+            _log.info(
+                "lgd_inputs_prepared",
+                run_id=run_id,
+                filenames=[u.original_filename for u in lgd_uploads],
+                loans=len(prepared.exposure),
+                excluded=len(prepared.excluded),
+                collateral_types=prepared.collateral_types,
+                configured_types=[c["name"] for c in collateral_config],
+                pct=40,
+            )
+            lgd_output = compute_lgd(prepared)
             _log.info("lgd_computed", run_id=run_id, output_rows=len(lgd_output), pct=80)
 
             _log.info("lgd_inserting_results", run_id=run_id, rows=len(lgd_output), pct=85)
@@ -598,13 +511,22 @@ async def _lgd_main(run_id: str) -> dict[str, str]:
 
 
 async def _ead_ecl_main(run_id: str) -> dict[str, str]:
-    """EAD + ECL stage — runs in the calling event loop."""
+    """EAD + ECL stage: spec Steps 2-11 and the 12.1 reconciliation."""
     from app.core.run_enums import OutputArtifactKind, RunStatus, UploadKind
     from app.engine import ENGINE_VERSION
-    from app.engine.bulk_insert import bulk_insert_ead_results
-    from app.engine.ead_engine import compute_ead
-    from app.engine.excel_writer import build_ecl_aggregates, generate_all_workbooks
-    from app.engine.lgd_engine import compute_lgd
+    from app.engine.bulk_insert import (
+        bulk_insert_ead_results,
+        bulk_insert_exceptions,
+        bulk_insert_loan_summaries,
+    )
+    from app.engine.ecl_pipeline import run_ecl
+    from app.engine.ecl_workbooks import (
+        LOAN_DETAIL_FILENAME,
+        PORTFOLIO_FILENAME,
+        build_loan_detail_workbook,
+        build_portfolio_workbook,
+    )
+    from app.engine.excel_writer import _build_pd_calcs_workbook
     from app.engine.pd_engine import compute_pd, is_pd_data_sheet
 
     async with _fresh_session() as (db, task_engine):
@@ -614,155 +536,133 @@ async def _ead_ecl_main(run_id: str) -> dict[str, str]:
             return {"run_id": run_id, "stage": "ead", "skipped": True}
         started_at = await _mark_stage_running(db, run.id, "ead", RunStatus.EAD_RUNNING.value)
         _log.info("compute_stage_started", run_id=run_id, stage="ead", pct=0)
-
-        ead_df = pd.DataFrame()
-        run_warnings: list[str] = []
         active_stage = "ead"
 
         try:
-            _log.info("ead_loading_uploads", run_id=run_id, pct=2)
-            ead_uploads = await _load_uploads(db, run_id, UploadKind.EAD.value)
-            if not ead_uploads:
-                msg = "No EAD uploads found for run"
-                raise ValueError(msg)
-            _log.info("ead_uploads_found", run_id=run_id, file_count=len(ead_uploads), filenames=[u.original_filename for u in ead_uploads], pct=5)
-
-            _log.info("ead_downloading_files", run_id=run_id, pct=8)
-            ead_files = await _download_uploads(ead_uploads)
-            _log.info("ead_files_downloaded", run_id=run_id, total_bytes=sum(len(f) for f in ead_files), pct=12)
-
-            _log.info("ead_combining_sheets", run_id=run_id, pct=14)
-            ead_input = _combine_excel_bytes(ead_files)
-            _log.info("ead_data_combined", run_id=run_id, loan_rows=len(ead_input), pct=16)
-
-            _log.info("ead_loading_pd_results_from_db", run_id=run_id, pct=18)
-            pd_df = await _load_pd_dataframe(db, run_id)
-            _log.info("ead_pd_results_loaded", run_id=run_id, pd_rows=len(pd_df), pct=22)
-
-            _log.info("ead_loading_lgd_results_from_db", run_id=run_id, pct=24)
-            lgd_df = await _load_lgd_dataframe(db, run_id)
-            _log.info("ead_lgd_results_loaded", run_id=run_id, lgd_rows=len(lgd_df), pct=28)
-
-            unique_loans = ead_input["Loan ID"].nunique() if "Loan ID" in ead_input.columns else len(ead_input)
-            _log.info("ead_computing_rundown_schedules", run_id=run_id, unique_loans=unique_loans, pct=30)
-            ead_df, run_warnings = compute_ead(ead_input, pd_df, lgd_df)
-            _log.info(
-                "ead_rundown_computed",
-                run_id=run_id,
-                snapshot_rows=len(ead_df),
-                unique_loans=unique_loans,
-                warnings=len(run_warnings),
-                warning_messages=run_warnings[:3] if run_warnings else [],
-                pct=62,
-            )
-
-            _log.info("ead_inserting_results", run_id=run_id, rows=len(ead_df), pct=65)
-            async with task_engine.begin() as conn:
-                await bulk_insert_ead_results(conn, run.id, run.tenant_id, ead_df)
-            _log.info("ead_results_inserted", run_id=run_id, rows=len(ead_df), pct=70)
-
-            del pd_df, lgd_df
-            gc.collect()
-
-            ecl_started_at = _iso_now()
-            active_stage = "ecl"
-            _log.info("ecl_stage_starting", run_id=run_id, pct=72)
-            await _atomic_stage_update(
-                db,
-                run.id,
-                "ecl",
-                {"status": "running", "started_at": ecl_started_at, "finished_at": None, "elapsed_ms": None},
-            )
-
-            _log.info("ecl_computing_aggregates", run_id=run_id, pct=74)
-            aggregates = build_ecl_aggregates(ead_df, ead_input)
-            total_ecl = Decimal(str(aggregates["total_ecl"]))
-            total_outstanding = Decimal(str(aggregates["total_outstanding"]))
-            coverage_ratio = Decimal(str(aggregates["coverage_ratio"]))
-            _log.info(
-                "ecl_aggregates_computed",
-                run_id=run_id,
-                total_ecl=float(total_ecl),
-                total_outstanding=float(total_outstanding),
-                coverage_ratio=float(coverage_ratio),
-                pct=76,
-            )
-
-            _log.info("ecl_verifying_totals_from_db", run_id=run_id, pct=78)
-            async with task_engine.begin() as conn:
-                sql_total_ecl, sql_outstanding, sql_coverage = await _compute_run_totals(conn, run_id)
-                total_ecl = sql_total_ecl
-                total_outstanding = sql_outstanding
-                coverage_ratio = sql_coverage
-            _log.info(
-                "ecl_db_totals_verified",
-                run_id=run_id,
-                total_ecl=float(total_ecl),
-                total_outstanding=float(total_outstanding),
-                coverage_ratio=float(coverage_ratio),
-                pct=80,
-            )
-
-            _log.info("ecl_regenerating_pd_for_workbooks", run_id=run_id, pct=82)
+            _log.info("ead_loading_inputs", run_id=run_id, pct=5)
+            prepared, ead_uploads, lgd_uploads, collateral_config = await _prepare_ecl_inputs(db, run)
+            # Recompute the PD curve from the PD files rather than reading pd_results,
+            # which are rounded to 8 decimals: the exact curve validation previewed.
             pd_uploads = await _load_uploads(db, run_id, UploadKind.PD.value)
             pd_files = await _download_uploads(pd_uploads)
             if not run.combine_pd_files and len(pd_files) > 1:
                 pd_files = pd_files[:1]
             pd_input = _combine_excel_bytes(pd_files, keep_sheet=is_pd_data_sheet)
             pd_output, cure_rates, intermediates = compute_pd(pd_input)
-            _log.info("ecl_pd_recomputed_for_workbooks", run_id=run_id, pd_rows=len(pd_output), pct=85)
+            pd_df = pd_output
+            _log.info(
+                "ead_inputs_prepared",
+                run_id=run_id,
+                loans=len(prepared.exposure),
+                excluded=len(prepared.excluded),
+                reporting_date=str(prepared.reporting_date),
+                pd_rows=len(pd_df),
+                pct=20,
+            )
 
-            _log.info("ecl_regenerating_lgd_for_workbooks", run_id=run_id, pct=86)
-            lgd_uploads = await _load_uploads(db, run_id, UploadKind.LGD.value)
-            lgd_files = await _download_uploads(lgd_uploads)
-            lgd_input = _combine_excel_bytes(lgd_files)
-            collateral_config = await _load_collateral_config(db, run.tenant_id)
-            lgd_full_df = compute_lgd(lgd_input, collateral_config)
-            _log.info("ecl_lgd_recomputed_for_workbooks", run_id=run_id, lgd_rows=len(lgd_full_df), pct=88)
+            ecl = run_ecl(prepared, pd_df)
+            _log.info(
+                "ead_rows_computed",
+                run_id=run_id,
+                snapshot_rows=len(ecl.rows),
+                exceptions=len(ecl.exceptions),
+                reconciliation_passed=ecl.reconciliation_passed,
+                pct=55,
+            )
 
+            async with task_engine.begin() as conn:
+                for table in ("ead_results", "ecl_loan_summaries", "run_exceptions"):
+                    await conn.execute(text(f"DELETE FROM {table} WHERE run_id = :run_id"), {"run_id": run.id})
+                await bulk_insert_ead_results(conn, run.id, run.tenant_id, ecl.rows)
+                await bulk_insert_loan_summaries(conn, run.id, run.tenant_id, ecl.loan_summary)
+                await bulk_insert_exceptions(conn, run.id, run.tenant_id, ecl.exceptions)
+            _log.info("ead_results_inserted", run_id=run_id, rows=len(ecl.rows), pct=70)
+
+            ecl_started_at = _iso_now()
+            active_stage = "ecl"
+            await _atomic_stage_update(
+                db,
+                run.id,
+                "ecl",
+                {"status": "running", "started_at": ecl_started_at, "finished_at": None, "elapsed_ms": None},
+            )
+            total_ecl = Decimal(str(ecl.total_ecl))
+            total_outstanding = Decimal(str(ecl.total_outstanding))
+            coverage_ratio = Decimal(str(ecl.coverage_ratio))
+            run_warnings = [
+                f"{e.category} · {e.loan_id or e.customer_id or e.dataset} · {e.issue} → {e.action}"
+                for e in ecl.exceptions[:50]
+            ]
+
+            from app.modules.auth.models import User
+
+            run_by = await db.scalar(select(User.email).where(User.id == run.created_by_user_id))
             timestamp_utc = _iso_now()
-            input_hashes = await _input_hashes(db, run_id)
+            engine_version = run.engine_version or ENGINE_VERSION
+
+            def _input(dataset: str, uploads, rows: int) -> dict[str, Any]:
+                return {
+                    "dataset": dataset,
+                    "file": ", ".join(u.original_filename for u in uploads),
+                    "modified": max(u.created_at for u in uploads).strftime("%Y-%m-%d %H:%M UTC"),
+                    "rows": rows,
+                }
+
+            meta = {
+                "run_at": timestamp_utc,
+                "run_by": run_by or run.created_by_user_id,
+                "run_id": run.id,
+                "engine_version": engine_version,
+                "inputs": [
+                    _input("Exposure Dataset (EAD)", ead_uploads, prepared.exposure_rows_in),
+                    _input("Collateral Dataset (LGD)", lgd_uploads, sum(u.row_count or 0 for u in lgd_uploads)),
+                    {
+                        "dataset": "Collateral Parameters",
+                        "file": "Workspace collateral types",
+                        "modified": "current settings",
+                        "rows": len(collateral_config),
+                    },
+                    _input("PD Dataset (from PD files)", pd_uploads, len(pd_df)),
+                ],
+            }
             run_meta = {
                 "run_id": run.id,
                 "tenant_id": run.tenant_id,
                 "timestamp_utc": timestamp_utc,
-                "engine_version": run.engine_version or ENGINE_VERSION,
-                "input_hashes": input_hashes,
+                "engine_version": engine_version,
+                "input_hashes": await _input_hashes(db, run_id),
             }
-            pd_data = {
-                "pd_df": pd_output,
-                "cure_rates": cure_rates,
-                "intermediates": intermediates,
+            workbooks = {
+                "PD Calcs.xlsx": _build_pd_calcs_workbook(
+                    run_meta, {"pd_df": pd_output, "cure_rates": cure_rates, "intermediates": intermediates}
+                ),
+                LOAN_DETAIL_FILENAME: build_loan_detail_workbook(ecl, meta),
+                PORTFOLIO_FILENAME: build_portfolio_workbook(ecl, meta),
             }
-            aggregates["ecl_total"]["Run ID"] = run.id
-            aggregates["ecl_total"]["Engine Version"] = run_meta["engine_version"]
-            aggregates["ecl_total"]["Timestamp UTC"] = timestamp_utc
-            aggregates["total_ecl"] = float(total_ecl)
-            aggregates["total_outstanding"] = float(total_outstanding)
-            aggregates["coverage_ratio"] = float(coverage_ratio)
-
-            _log.info("ecl_generating_workbooks", run_id=run_id, pct=90)
-            workbooks = generate_all_workbooks(
-                run_meta,
-                pd_data,
-                lgd_full_df,
-                ead_df,
-                aggregates,
-            )
             artifact_kinds = {
                 "PD Calcs.xlsx": OutputArtifactKind.PD_CALCS.value,
-                "LGD.xlsx": OutputArtifactKind.LGD.value,
-                "Contractual Rundown.xlsx": OutputArtifactKind.RUNDOWN.value,
-                "ECL Summary.xlsx": OutputArtifactKind.ECL_SUMMARY.value,
+                LOAN_DETAIL_FILENAME: OutputArtifactKind.LOAN_DETAIL.value,
+                PORTFOLIO_FILENAME: OutputArtifactKind.PORTFOLIO_SUMMARY.value,
             }
-            workbook_sizes = {name: len(data) for name, data in workbooks.items()}
-            _log.info("ecl_workbooks_generated", run_id=run_id, workbooks=list(workbook_sizes.keys()), sizes_bytes=workbook_sizes, pct=93)
-
-            _log.info("ecl_uploading_workbooks_to_storage", run_id=run_id, pct=94)
+            _log.info("ecl_workbooks_generated", run_id=run_id, sizes={k: len(v) for k, v in workbooks.items()}, pct=90)
             await _upload_workbooks(db, run, workbooks, artifact_kinds)
-            _log.info("ecl_workbooks_uploaded", run_id=run_id, workbook_count=len(workbooks), pct=96)
+            _log.info("ecl_workbooks_uploaded", run_id=run_id, pct=96)
 
-            del pd_input, pd_output, lgd_input, lgd_full_df, ead_input, workbooks
+            run.reporting_date = prepared.reporting_date.date() if prepared.reporting_date is not None else None
+            run.reconciliation = [
+                {
+                    "name": c.name,
+                    "expected": c.expected,
+                    "actual": c.actual,
+                    "difference": c.difference,
+                    "passed": c.passed,
+                    "detail": c.detail,
+                }
+                for c in ecl.reconciliation
+            ]
+            await db.commit()
+
+            del pd_input, pd_output, workbooks, ecl
             gc.collect()
 
             ead_progress = await _mark_stage_complete(db, run.id, "ead", started_at)

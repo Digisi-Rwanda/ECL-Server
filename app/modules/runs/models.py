@@ -1,10 +1,11 @@
-from datetime import datetime
+from datetime import date, datetime
 from decimal import Decimal
 
 from sqlalchemy import (
     JSON,
     BigInteger,
     Boolean,
+    Date,
     DateTime,
     Index,
     Integer,
@@ -31,6 +32,11 @@ class Run(Base):
     created_by_user_id: Mapped[str] = mapped_column(String(26), nullable=False)
     name: Mapped[str] = mapped_column(Text, nullable=False)
     reporting_period: Mapped[str | None] = mapped_column(Text, nullable=True)
+    # Spec 1.5: exposure rows with another Reporting Date are excluded. Null until
+    # set by the user or defaulted from the EAD file's most common date.
+    reporting_date: Mapped[date | None] = mapped_column(Date, nullable=True)
+    # Spec 12.1 results: [{name, expected, actual, difference, passed, detail}].
+    reconciliation: Mapped[list | None] = mapped_column(JSON, nullable=True)
     status: Mapped[str] = mapped_column(Text, nullable=False, server_default="draft")
     engine_version: Mapped[str] = mapped_column(Text, nullable=False, server_default="v1.0.0")
     engine_progress: Mapped[dict | None] = mapped_column(JSON, nullable=True)

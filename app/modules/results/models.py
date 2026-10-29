@@ -1,7 +1,19 @@
 from datetime import date, datetime
 from decimal import Decimal
 
-from sqlalchemy import BigInteger, Date, DateTime, Index, Integer, JSON, Numeric, String, Text, func
+from sqlalchemy import (
+    JSON,
+    BigInteger,
+    Boolean,
+    Date,
+    DateTime,
+    Index,
+    Integer,
+    Numeric,
+    String,
+    Text,
+    func,
+)
 from sqlalchemy.orm import Mapped, mapped_column
 
 from app.database import Base
@@ -79,6 +91,9 @@ class EadResult(Base):
     bal_after_repayment: Mapped[Decimal] = mapped_column(Numeric(20, 6), nullable=False)
     bal_after_missed: Mapped[Decimal] = mapped_column(Numeric(20, 6), nullable=False)
     marginal_pd: Mapped[Decimal | None] = mapped_column(Numeric(10, 8), nullable=True)
+    cure_rate: Mapped[Decimal | None] = mapped_column(Numeric(10, 8), nullable=True)
+    treatment: Mapped[str | None] = mapped_column(Text, nullable=True)
+    pd_rule: Mapped[str | None] = mapped_column(Text, nullable=True)
     lgw: Mapped[Decimal] = mapped_column(Numeric(10, 8), nullable=False)
     lgd: Mapped[Decimal] = mapped_column(Numeric(10, 8), nullable=False)
     credit_loss: Mapped[Decimal] = mapped_column(Numeric(20, 6), nullable=False)
@@ -98,3 +113,47 @@ class OutputArtifact(Base):
     created_at: Mapped[datetime] = mapped_column(
         DateTime(timezone=True), server_default=func.now(), nullable=False
     )
+
+
+class EclLoanSummary(Base):
+    """Spec Step 11 Loan Summary: one row per loan, the capped Total ECL.
+
+    Every portfolio figure reads from here, never from summing ead_results,
+    because the cap applies at loan level only.
+    """
+
+    __tablename__ = "ecl_loan_summaries"
+    __table_args__ = (Index("ecl_loan_summaries_run_segment_idx", "run_id", "segment"),)
+
+    id: Mapped[str] = mapped_column(String(26), primary_key=True)
+    run_id: Mapped[str] = mapped_column(String(26), nullable=False, index=True)
+    tenant_id: Mapped[str] = mapped_column(String(26), nullable=False, index=True)
+    loan_id: Mapped[str] = mapped_column(Text, nullable=False)
+    customer_id: Mapped[str] = mapped_column(Text, nullable=False)
+    segment: Mapped[str] = mapped_column(Text, nullable=False)
+    stage: Mapped[str] = mapped_column(Text, nullable=False)
+    reporting_date: Mapped[date] = mapped_column(Date, nullable=False)
+    outstanding: Mapped[Decimal] = mapped_column(Numeric(20, 6), nullable=False)
+    discounted_collateral: Mapped[Decimal] = mapped_column(Numeric(20, 6), nullable=False)
+    ecl_before_cap: Mapped[Decimal] = mapped_column(Numeric(20, 6), nullable=False)
+    ecl_capped: Mapped[bool] = mapped_column(Boolean, nullable=False)
+    total_ecl: Mapped[Decimal] = mapped_column(Numeric(20, 6), nullable=False)
+
+
+class RunException(Base):
+    """Spec 12.2 Exception Report line."""
+
+    __tablename__ = "run_exceptions"
+
+    id: Mapped[str] = mapped_column(String(26), primary_key=True)
+    run_id: Mapped[str] = mapped_column(String(26), nullable=False, index=True)
+    tenant_id: Mapped[str] = mapped_column(String(26), nullable=False, index=True)
+    seq: Mapped[int] = mapped_column(Integer, nullable=False)
+    category: Mapped[str] = mapped_column(Text, nullable=False)
+    dataset: Mapped[str] = mapped_column(Text, nullable=False)
+    loan_id: Mapped[str] = mapped_column(Text, nullable=False, server_default="")
+    customer_id: Mapped[str] = mapped_column(Text, nullable=False, server_default="")
+    field: Mapped[str] = mapped_column(Text, nullable=False)
+    value: Mapped[str] = mapped_column(Text, nullable=False, server_default="")
+    issue: Mapped[str] = mapped_column(Text, nullable=False)
+    action: Mapped[str] = mapped_column(Text, nullable=False)

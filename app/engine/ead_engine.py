@@ -1,488 +1,267 @@
-"""EAD (Exposure at Default) and ECL computation engine."""
+"""Steps 2-10 of the ECL specification (v1.0): exposure rundown, PD join, loss.
+
+Expected Credit Loss for one loan and one month is
+    Credit Loss = EAD x Marginal PD x LGD,
+discounted back to the Reporting Date at the loan's EIR. This module builds
+EAD (Steps 3-7), joins the PD curve (Step 8) and applies LGW/LGD and the
+discount (Steps 9-10). Inputs come from `ecl_rules.prepare_inputs` and
+`lgd_engine.compute_lgd`, so every row here belongs to an included loan.
+"""
 
 from __future__ import annotations
 
-from datetime import date
-from decimal import Decimal
-
 import numpy as np
-import numpy_financial as npf
 import pandas as pd
 
-_STAGING_ALIASES = ("Staging", "Staging (Stage)")
-_EIR_ALIASES = ("Effective Interest Rate", "Effective Interest Rate (EIR)", "EIR")
-_FREQ_ALIASES = ("Repayment Frequency", "Payment Frequency")
-_LGD_SUM_COL = "Sum of Discounted Collaterals per Loan ID"
-_LGD_SUM_SHORT = "Sum of Discounted Collaterals"
-_MISSED_EPS = 1e-9
+from app.engine.ecl_rules import (
+    CAT_PD,
+    CUSTOMER_ID,
+    DS_PD,
+    EIR,
+    FIRST_PAYMENT_DATE,
+    LOAN_ID,
+    MATURITY_DATE,
+    OUTSTANDING,
+    REPORTING_DATE,
+    SEGMENT,
+    STAGE,
+    ExceptionLine,
+)
+from app.engine.lgd_engine import DISCOUNTED_COLLATERAL
 
-# ECL formula context: Expected Credit Loss = EAD x PD x LGD, discounted to
-# present value. This module derives EAD (via loan-balance amortization),
-# combines it with PD (from pd_engine.py) and collateral (from
-# lgd_engine.py) to get LGD, and computes the final Credit Loss /
-# Discounted ECL. See compute_ead() below, particularly the "Credit Loss"
-# and "Discounted ECL" lines, for the core formula.
+ADJUSTED_MATURITY = "Adjusted Maturity Date"
+TREATMENT = "Treatment"
+SNAPSHOT_DATE = "Snapshot Date"
+PERIOD_SINCE_ORIGINATION = "Period Since Origination"
+MONTHLY_INSTALMENT = "Monthly Instalment"
+BAL_AFTER_REPAYMENT = "Balance After Repayment"
+BAL_AFTER_MISSED = "Balance After Missed Payment"
+PERIOD_TO_DISCOUNT = "Period to Be Discounted"
+MARGINAL_PD = "Marginal PD"
+CURE_RATE = "Cure Rate"
+PD_RULE = "PD Rule"
+LGW = "LGW"
+LGD = "LGD"
+CREDIT_LOSS = "Credit Loss"
+DISCOUNTED_ECL = "Discounted ECL"
+
+MAX_MISSED_PAYMENTS = 3
+
+# Treatment labels, also shown in the UI and the workbooks.
+T_STAGE1 = "Stage 1 · 12 months"
+T_STAGE2 = "Stage 2 · lifetime"
+T_STAGE3 = "Stage 3 · single row"
+T_MATURED = "Matured · single row"
+T_ZERO_RATE = "Zero rate · single row"
+
+# PD Rule labels (Step 8).
+R_NO_PD_ROW0 = "Reporting-date row: no PD"
+R_STAGE3 = "Stage 3: Marginal PD = 100%"
+R_CURVE = "PD curve"
+R_LAST_MONTH = "Beyond curve: last available Month"
+R_UNMATCHED = "No PD match"
+
+ROW_COLUMNS = [
+    LOAN_ID,
+    CUSTOMER_ID,
+    SEGMENT,
+    STAGE,
+    TREATMENT,
+    REPORTING_DATE,
+    FIRST_PAYMENT_DATE,
+    MATURITY_DATE,
+    ADJUSTED_MATURITY,
+    OUTSTANDING,
+    EIR,
+    DISCOUNTED_COLLATERAL,
+    SNAPSHOT_DATE,
+    PERIOD_SINCE_ORIGINATION,
+    MONTHLY_INSTALMENT,
+    BAL_AFTER_REPAYMENT,
+    BAL_AFTER_MISSED,
+    PERIOD_TO_DISCOUNT,
+    MARGINAL_PD,
+    CURE_RATE,
+    PD_RULE,
+    LGW,
+    LGD,
+    CREDIT_LOSS,
+    DISCOUNTED_ECL,
+]
 
 
-def _resolve_column(df: pd.DataFrame, names: tuple[str, ...], default: str) -> str:
-    for name in names:
-        if name in df.columns:
-            return name
-    return default
+def month_index(dates: pd.Series | pd.DatetimeIndex) -> np.ndarray:
+    """Calendar months since year 0: months_between(A, B) = index(B) - index(A)."""
+    d = pd.DatetimeIndex(dates)
+    return np.asarray(d.year * 12 + (d.month - 1), dtype=np.int64)
 
 
-def _to_decimal(value: float | int | Decimal) -> Decimal:
-    return Decimal(str(value))
+def add_months(start: pd.Series, months: np.ndarray) -> pd.DatetimeIndex:
+    """Same day n months later, clamped to the month's last day (31 Jan + 1 = 28/29 Feb)."""
+    start = pd.DatetimeIndex(start)
+    total = start.year.to_numpy() * 12 + (start.month.to_numpy() - 1) + months
+    first = pd.to_datetime(pd.DataFrame({"year": total // 12, "month": total % 12 + 1, "day": 1}))
+    day = np.minimum(start.day.to_numpy(), first.dt.days_in_month.to_numpy())
+    return pd.DatetimeIndex(first + pd.to_timedelta(day - 1, unit="D"))
 
 
-def _months_between(start: date | pd.Timestamp, end: date | pd.Timestamp) -> int:
-    # Math: months = (end.year - start.year) x 12 + (end.month - start.month)
-    # Whole-calendar-month difference between two dates (ignores day-of-month).
-    start_ts = pd.Timestamp(start)
-    end_ts = pd.Timestamp(end)
-    return (end_ts.year - start_ts.year) * 12 + (end_ts.month - start_ts.month)
+def instalment(outstanding: float, monthly_rate: float, remaining_months: int) -> float:
+    # Level payment: P x r / (1 - (1 + r)^(-n)), the standard amortisation formula.
+    return outstanding * monthly_rate / (1.0 - (1.0 + monthly_rate) ** (-remaining_months))
 
 
-def _period_instalment(
-    outstanding: float,
-    eir: float,
-    remaining_months: int,
-    freq: str = "MTH",
-) -> float:
-    """Compute the periodic instalment using numpy_financial PMT.
+def project_exposure(exposure: pd.DataFrame, lgd: pd.DataFrame) -> pd.DataFrame:
+    """Steps 2-7: snapshot rows, period since origination, instalment, balances."""
+    loans = exposure.sort_values(LOAN_ID, kind="mergesort").reset_index(drop=True)
+    # Step 2: left-join Discounted Collateral; no collateral record -> 0.
+    collateral = lgd.set_index(LOAN_ID)[DISCOUNTED_COLLATERAL]
+    loans[DISCOUNTED_COLLATERAL] = loans[LOAN_ID].map(collateral).fillna(0.0).astype(float)
+    if loans.empty:
+        return pd.DataFrame(columns=ROW_COLUMNS[: ROW_COLUMNS.index(PERIOD_TO_DISCOUNT) + 1])
 
-    For MTH: monthly rate = eir/12, periods = remaining_months.
-    For QTR: quarterly rate = eir/4, periods = remaining_months // 3.
-    Monthly accrual in the balance walk always uses eir/12 regardless of freq.
-    """
-    # Math: PMT = P x r / (1 - (1 + r)^(-n))
-    #   P = outstanding principal, r = rate per period, n = periods remaining
-    #   (PMT = P / n when r == 0)
-    # The standard fixed-instalment loan amortization payment formula --
-    # the same arithmetic behind any mortgage/loan calculator.
-    if freq == "QTR":
-        periods = max(1, remaining_months // 3)
-        period_rate = eir / 4.0
-        if period_rate == 0.0:
-            return outstanding / periods if periods else 0.0
-        return float(-npf.pmt(period_rate, periods, outstanding))
+    # Adjusted Maturity Date = last day of the Maturity Date's month.
+    loans[ADJUSTED_MATURITY] = loans[MATURITY_DATE] + pd.offsets.MonthEnd(0)
+    rep_m = month_index(loans[REPORTING_DATE])
+    fp_m = month_index(loans[FIRST_PAYMENT_DATE])
+    adj_m = month_index(loans[ADJUSTED_MATURITY])
+    # Remaining months = Total term - Elapsed = months(FP, AdjMat) - months(FP, Reporting).
+    remaining = adj_m - rep_m
+    # Matured: Adjusted Maturity on/before the Reporting Date or in its month.
+    matured = remaining <= 0
+    stage = loans[STAGE].to_numpy()
+    eir = loans[EIR].to_numpy(dtype=float)
+    zero_rate = eir == 0
+    single = (stage == "Stage 3") | matured | zero_rate
 
-    # Default: MTH
-    if remaining_months <= 0:
-        return 0.0
+    loans[TREATMENT] = np.select(
+        [stage == "Stage 3", matured, zero_rate, stage == "Stage 1"],
+        [T_STAGE3, T_MATURED, T_ZERO_RATE, T_STAGE1],
+        default=T_STAGE2,
+    )
+    # Rows n = 0..max_n. AdjMat is a month end, so Reporting + n months <= AdjMat
+    # exactly when n <= remaining.
+    max_n = np.where(single, 0, np.where(stage == "Stage 1", np.minimum(12, remaining), remaining))
+
     monthly_rate = eir / 12.0
-    if monthly_rate == 0.0:
-        return outstanding / remaining_months
-    return float(-npf.pmt(monthly_rate, remaining_months, outstanding))
+    outstanding = loans[OUTSTANDING].to_numpy(dtype=float)
+    # Step 5: instalment once per loan, as at the Reporting Date.
+    pmt = np.zeros(len(loans))
+    for i in np.flatnonzero(~((stage == "Stage 3") | matured | (monthly_rate == 0))):
+        pmt[i] = instalment(outstanding[i], monthly_rate[i], int(remaining[i]))
+    loans[MONTHLY_INSTALMENT] = pmt
+
+    lengths = max_n + 1
+    loan_idx = np.repeat(np.arange(len(loans)), lengths)
+    t = np.concatenate([np.arange(n) for n in lengths])
+    rows = loans.iloc[loan_idx].reset_index(drop=True)
+    rows[SNAPSHOT_DATE] = add_months(rows[REPORTING_DATE], t)
+    # Step 4: months_between(First Payment Date, Snapshot Date), calendar months.
+    rows[PERIOD_SINCE_ORIGINATION] = rep_m[loan_idx] + t - fp_m[loan_idx]
+    rows[PERIOD_TO_DISCOUNT] = t
+
+    # Step 6: first row = Outstanding; then max(0, previous x (1 + EIR/12) - instalment).
+    g = 1.0 + monthly_rate[loan_idx]
+    p = pmt[loan_idx]
+    bal = np.empty(len(rows))
+    for j in range(len(rows)):
+        bal[j] = outstanding[loan_idx[j]] if t[j] == 0 else max(0.0, bal[j - 1] * g[j] - p[j])
+    rows[BAL_AFTER_REPAYMENT] = bal
+    # Step 7: k = min(t, 3) missed payments; Balance After Repayment[t-k] x (1 + EIR/12)^k.
+    k = np.minimum(t, MAX_MISSED_PAYMENTS)
+    rows[BAL_AFTER_MISSED] = bal[np.arange(len(rows)) - k] * g**k
+    return rows
 
 
-def _count_missed_periods(
-    row_idx: int,
-    opening_balances: list[float],
-    monthly_rate: float,
-    instalment: float,
-    freq: str = "MTH",
-) -> int:
-    """Count missed payment periods among the last 3 payment events.
+def attach_pd(
+    rows: pd.DataFrame, pd_curve: pd.DataFrame
+) -> tuple[pd.DataFrame, list[ExceptionLine]]:
+    """Step 8: join Marginal PD and Cure Rate on (SEGMENT, Month, Transition)."""
+    curve = pd_curve[["SEGMENT", "Month", "Transition", "Marginal_PD", "Cure_Rate"]].copy()
+    # The PD Dataset is produced by pd_engine, which guarantees one row per key and
+    # values in 0-1; a breach is an engine bug, not user data to report.
+    if curve.duplicated(["SEGMENT", "Month", "Transition"]).any():
+        raise ValueError("PD curve has duplicate (SEGMENT, Month, Transition) keys")
+    if not curve[["Marginal_PD", "Cure_Rate"]].stack().between(0.0, 1.0).all():
+        raise ValueError("PD curve has Marginal PD or Cure Rate outside 0-1")
 
-    For MTH: each row is a payment month — look back 3 rows.
-    For QTR: payments fall on rows where (row_idx+1) % 3 == 0 — look back at
-    the last 3 prior payment rows.
-    """
-    # Math: for each of the last 3 payment checkpoints i,
-    #   flag "missed" if Opening_i x (1 + monthly_rate) < instalment
-    # This is a proxy built from the projected balance trajectory itself,
-    # not from an actual payment-received/not-received record in the data.
-    if instalment <= 0:
-        return 0
+    out = rows.copy()
+    last_month = curve.groupby(["SEGMENT", "Transition"])["Month"].max()
+    last = pd.MultiIndex.from_arrays([out[SEGMENT], out[STAGE]]).map(last_month.to_dict().get)
+    last = pd.to_numeric(pd.Series(last, index=out.index), errors="coerce")
+    pso = out[PERIOD_SINCE_ORIGINATION]
+    beyond = last.notna() & (pso > last)
+    lookup_month = pso.where(~beyond, last)
 
-    if freq == "QTR":
-        payment_rows = [i for i in range(row_idx) if (i + 1) % 3 == 0]
-        lookback = payment_rows[-3:]
-    else:
-        lookback = range(max(0, row_idx - 3), row_idx)
+    keyed = curve.set_index(["SEGMENT", "Transition", "Month"])
+    key = pd.MultiIndex.from_arrays([out[SEGMENT], out[STAGE], lookup_month.astype("Int64")])
+    joined_pd = keyed["Marginal_PD"].reindex(key).to_numpy()
+    cure_by_segment = curve.groupby("SEGMENT")["Cure_Rate"].first()
+    out[CURE_RATE] = out[SEGMENT].map(cure_by_segment).astype(float)
 
-    missed = 0
-    for prior_idx in lookback:
-        opening = opening_balances[prior_idx]
-        balance_after_interest = opening * (1.0 + monthly_rate)
-        if balance_after_interest + _MISSED_EPS < instalment:
-            missed += 1
-    return min(missed, 3)
+    first_row = out[PERIOD_TO_DISCOUNT] == 0
+    multi_row = out[TREATMENT].isin([T_STAGE1, T_STAGE2])
+    is_stage3 = out[STAGE] == "Stage 3"
+    matched = ~np.isnan(joined_pd)
 
-
-def _walk_loan_balances(group: pd.DataFrame) -> pd.DataFrame:
-    group = group.sort_values("Snapshot Date", kind="mergesort").copy()
-    outstanding = float(group["Outstanding Amount"].iloc[0])
-    eir = float(group["EIR"].iloc[0])
-    monthly_rate = eir / 12.0
-    instalment = float(group["Monthly Instalment"].iloc[0])
-    freq = str(group["_freq"].iloc[0]) if "_freq" in group.columns else "MTH"
-
-    balances_after_repayment: list[float] = []
-    balances_after_missed: list[float] = []
-    opening_balances: list[float] = []
-
-    for row_idx in range(len(group)):
-        if row_idx == 0:
-            opening = outstanding
-        else:
-            opening = balances_after_repayment[row_idx - 1]
-
-        opening_balances.append(opening)
-
-        # For QTR loans, apply the instalment only on payment months (every 3rd row).
-        is_payment_month = (freq != "QTR") or ((row_idx + 1) % 3 == 0)
-        effective_instalment = instalment if is_payment_month else 0.0
-
-        # Math: BalanceAfterRepayment_t = max(0, Opening_t x (1+r) - PMT_t)
-        after_repayment = opening * (1.0 + monthly_rate) - effective_instalment
-        if after_repayment < 0:
-            after_repayment = 0.0
-        balances_after_repayment.append(after_repayment)
-
-        missed_count = _count_missed_periods(
-            row_idx, opening_balances, monthly_rate, instalment, freq
-        )
-        # Math: EAD_t = BalanceAfterRepayment_t x (1+r)^(MissedCount_t)
-        # Extra interest compounded on top for recently-missed instalments;
-        # this final value is the model's Exposure at Default for period t.
-        after_missed = after_repayment * ((1.0 + monthly_rate) ** missed_count)
-        balances_after_missed.append(after_missed)
-
-    group["Balance After Repayment"] = balances_after_repayment
-    group["Balance After Missed Payment"] = balances_after_missed
-    group["Period to be Discounted"] = range(len(group))
-    return group
-
-
-def _expand_snapshots(merged: pd.DataFrame) -> pd.DataFrame:
-    """Vectorised snapshot date expansion — replaces iterrows() loop.
-
-    Stage 3 → 1 snapshot per loan (reporting date).
-    Stage 1 → up to 13 snapshots (offsets 0–12, clipped at maturity).
-    Stage 2 → 1 snapshot per month from reporting date to maturity.
-    Unknown staging → treated as Stage 3 (single snapshot).
-    """
-    # Rule (not a formula): IFRS9 requires a 12-month loss horizon for
-    # Stage 1 (performing) loans, and a lifetime (to-maturity) horizon for
-    # Stage 2/3 loans. This determines how many future snapshot months get
-    # a Credit Loss / Discounted ECL computed further down in compute_ead().
-    rep_dates = pd.to_datetime(merged["Reporting Date"])
-    mat_dates = pd.to_datetime(merged["Maturity Date"])
-    merged = merged.copy()
-    merged["_rep_date"] = rep_dates
-    merged["_mat_date"] = mat_dates
-
-    parts: list[pd.DataFrame] = []
-
-    # Stage 3 — trivial: one snapshot per loan.
-    s3 = merged[merged["Staging"] == "Stage 3"].copy()
-    if not s3.empty:
-        s3["Snapshot Date"] = s3["_rep_date"]
-        parts.append(s3)
-
-    # Stage 1 — fixed 13 offsets, clipped at maturity.
-    s1 = merged[merged["Staging"] == "Stage 1"].reset_index(drop=True)
-    if not s1.empty:
-        s1_frames = [
-            s1.copy().assign(
-                **{"Snapshot Date": s1["_rep_date"] + pd.DateOffset(months=i)}
-            )
-            for i in range(13)
-        ]
-        s1_exp = pd.concat(s1_frames, ignore_index=True)
-        s1_exp["Snapshot Date"] = pd.to_datetime(s1_exp["Snapshot Date"])
-        s1_exp = s1_exp[s1_exp["Snapshot Date"] <= s1_exp["_mat_date"]]
-        parts.append(s1_exp)
-
-    # Stage 2 — variable horizon per loan; use np.repeat for row expansion.
-    s2 = merged[merged["Staging"] == "Stage 2"].reset_index(drop=True)
-    if not s2.empty:
-        s2_rep = s2["_rep_date"]
-        s2_mat = s2["_mat_date"]
-        max_months = [max(0, _months_between(r, m)) for r, m in zip(s2_rep, s2_mat)]
-        lens = [n + 1 for n in max_months]
-        row_idx_arr = np.repeat(np.arange(len(s2)), lens)
-        offset_arr = np.concatenate([np.arange(n) for n in lens])
-        s2_exp = s2.iloc[row_idx_arr].reset_index(drop=True)
-        s2_exp["Snapshot Date"] = [
-            s2_rep.iloc[row_idx_arr[i]] + pd.DateOffset(months=int(offset_arr[i]))
-            for i in range(len(s2_exp))
-        ]
-        s2_exp["Snapshot Date"] = pd.to_datetime(s2_exp["Snapshot Date"])
-        s2_exp = s2_exp[s2_exp["Snapshot Date"] <= s2_exp["_mat_date"]]
-        parts.append(s2_exp)
-
-    # Unknown staging — single snapshot, emit no warning here (validator catches this).
-    other = merged[~merged["Staging"].isin(["Stage 1", "Stage 2", "Stage 3"])].copy()
-    if not other.empty:
-        other["Snapshot Date"] = other["_rep_date"]
-        parts.append(other)
-
-    if not parts:
-        return pd.DataFrame()
-
-    result = pd.concat(parts, ignore_index=True)
-    result = result.drop(columns=["_rep_date", "_mat_date"], errors="ignore")
-    return result
-
-
-def compute_ead(
-    ead_df: pd.DataFrame,
-    pd_df: pd.DataFrame,
-    lgd_df: pd.DataFrame,
-) -> tuple[pd.DataFrame, list[str]]:
-    """Run the EAD/ECL computation pipeline."""
-    warnings: list[str] = []
-    working = ead_df.copy()
-
-    staging_col = _resolve_column(working, _STAGING_ALIASES, "Staging")
-    if staging_col != "Staging":
-        working = working.rename(columns={staging_col: "Staging"})
-
-    eir_col = _resolve_column(working, _EIR_ALIASES, "Effective Interest Rate")
-    if eir_col != "Effective Interest Rate":
-        working = working.rename(columns={eir_col: "Effective Interest Rate"})
-
-    # Resolve repayment frequency — default MTH if column is absent.
-    freq_col = _resolve_column(working, _FREQ_ALIASES, "")
-    if freq_col:
-        working["_freq"] = working[freq_col].astype(str).str.upper().str.strip()
-    else:
-        working["_freq"] = "MTH"
-    working["_freq"] = working["_freq"].where(
-        working["_freq"].isin({"MTH", "QTR"}), other="MTH"
+    out[MARGINAL_PD] = np.select(
+        [is_stage3, first_row & multi_row, matched],
+        [1.0, 0.0, joined_pd],
+        default=np.nan,
+    )
+    out[PD_RULE] = np.select(
+        [is_stage3, first_row & multi_row, matched & beyond, matched],
+        [R_STAGE3, R_NO_PD_ROW0, R_LAST_MONTH, R_CURVE],
+        default=R_UNMATCHED,
     )
 
-    working = working.sort_values(["Loan ID"], kind="mergesort").reset_index(drop=True)
-
-    lgd_subset = lgd_df[["Loan ID"]].copy()
-    if "EIR" in lgd_df.columns:
-        lgd_subset["EIR"] = lgd_df["EIR"]
-    if _LGD_SUM_COL in lgd_df.columns:
-        lgd_subset[_LGD_SUM_SHORT] = lgd_df[_LGD_SUM_COL]
-    elif _LGD_SUM_SHORT in lgd_df.columns:
-        lgd_subset[_LGD_SUM_SHORT] = lgd_df[_LGD_SUM_SHORT]
-    else:
-        lgd_subset[_LGD_SUM_SHORT] = 0.0
-    lgd_subset = lgd_subset.drop_duplicates(subset=["Loan ID"], keep="first")
-
-    merged = working.merge(lgd_subset, on="Loan ID", how="left")
-
-    missing_lgd_mask = merged[_LGD_SUM_SHORT].isna()
-    for loan_id in sorted(merged.loc[missing_lgd_mask, "Loan ID"].astype(str).unique()):
-        warnings.append(
-            f"EC-06: Loan {loan_id} in EAD but not in LGD — collateral treated as 0"
+    unmatched = out[out[PD_RULE] == R_UNMATCHED]
+    exceptions = [
+        ExceptionLine(
+            CAT_PD,
+            DS_PD,
+            str(r[LOAN_ID]),
+            str(r[CUSTOMER_ID]),
+            "SEGMENT / Month / Transition",
+            f"{r[SEGMENT]} / {int(r[PERIOD_SINCE_ORIGINATION])} / {r[STAGE]}",
+            f"No PD row for this key (snapshot {r[SNAPSHOT_DATE].date().isoformat()})",
+            "None (reported only) — row carries no Credit Loss",
         )
-    merged[_LGD_SUM_SHORT] = merged[_LGD_SUM_SHORT].fillna(0.0)
-
-    if "EIR" in merged.columns:
-        merged["EIR"] = merged["EIR"].fillna(merged["Effective Interest Rate"])
-    else:
-        merged["EIR"] = merged["Effective Interest Rate"]
-
-    # Step 2 — generate snapshot rows (vectorised per staging group).
-    snapshots = _expand_snapshots(merged)
-
-    if snapshots.empty:
-        empty = pd.DataFrame(
-            columns=[
-                "Loan ID",
-                "Customer ID",
-                "SEGMENT",
-                "Staging",
-                "Snapshot Date",
-                "Period Since Origination",
-                "Monthly Instalment",
-                "Balance After Repayment",
-                "Balance After Missed Payment",
-                "Period to be Discounted",
-                "Marginal PD",
-                "Cure Rate",
-                "LGW",
-                "LGD",
-                "Credit Loss",
-                "Discounted ECL",
-            ]
-        )
-        return empty, warnings
-
-    snapshots["Reporting Date"] = pd.to_datetime(snapshots["Reporting Date"])
-    snapshots["First Payment Date"] = pd.to_datetime(snapshots["First Payment Date"])
-    snapshots["Adjusted Maturity Date"] = pd.to_datetime(snapshots["Adjusted Maturity Date"])
-    snapshots["Snapshot Date"] = pd.to_datetime(snapshots["Snapshot Date"])
-
-    # Step 3 — period since origination.
-    # +1 matches PD.ipynb's calculate_period_since_origination(): a loan
-    # snapshotted in its origination month (0 calendar months elapsed) is
-    # treated as "month 1" to align with PD's 1-indexed Month column.
-    snapshots["Period Since Origination"] = [
-        _months_between(first_payment, snapshot) + 1
-        for first_payment, snapshot in zip(
-            snapshots["First Payment Date"],
-            snapshots["Snapshot Date"],
-            strict=True,
-        )
+        for _, r in unmatched.iterrows()
     ]
+    return out, exceptions
 
-    # Step 4 — periodic instalment (once per loan, frequency-aware).
-    loan_terms = snapshots.drop_duplicates(subset=["Loan ID"], keep="first").copy()
-    instalments: dict[str, float] = {}
-    for _, loan in loan_terms.iterrows():
-        elapsed = _months_between(loan["First Payment Date"], loan["Reporting Date"])
-        total_term = _months_between(loan["First Payment Date"], loan["Adjusted Maturity Date"])
-        remaining = total_term - elapsed
-        freq = str(loan.get("_freq", "MTH"))
-        instalments[str(loan["Loan ID"])] = _period_instalment(
-            float(loan["Outstanding Amount"]),
-            float(loan["EIR"]),
-            remaining,
-            freq,
-        )
-    snapshots["Monthly Instalment"] = snapshots["Loan ID"].astype(str).map(instalments)
 
-    # Steps 5–7 — balances and discount period via sequential group walk.
-    # Use a synthetic integer key so "Loan ID" is preserved as a regular column
-    # (pandas 3.0 excludes the groupby key column from group DataFrames passed to apply).
-    loan_ids_sorted = sorted(snapshots["Loan ID"].astype(str).unique())
-    loan_id_to_grp = {lid: i for i, lid in enumerate(loan_ids_sorted)}
-    snapshots["_grp"] = snapshots["Loan ID"].astype(str).map(loan_id_to_grp)
-    snapshots = (
-        snapshots.groupby("_grp", sort=True, group_keys=False)
-        .apply(_walk_loan_balances)
+def compute_losses(rows: pd.DataFrame) -> pd.DataFrame:
+    """Steps 9-10: LGW, LGD, Credit Loss and Discounted ECL."""
+    out = rows.copy()
+    ead = out[BAL_AFTER_MISSED].astype(float)
+    collateral = out[DISCOUNTED_COLLATERAL].astype(float)
+    # LGW = 0 if EAD = 0 else max(0, 1 - Discounted Collateral / EAD)
+    safe_ead = ead.where(ead != 0, 1.0)
+    out[LGW] = np.where(ead == 0, 0.0, np.maximum(0.0, 1.0 - collateral / safe_ead))
+    # LGD = LGW x (1 - Cure Rate)
+    out[LGD] = out[LGW] * (1.0 - out[CURE_RATE].fillna(0.0))
+    # Credit Loss = EAD x Marginal PD x LGD; an unmatched PD row carries none (reported in Step 8).
+    out[CREDIT_LOSS] = ead * out[MARGINAL_PD].fillna(0.0) * out[LGD]
+    # Discounted ECL = Credit Loss x (1 + EIR/12)^(-Period to Be Discounted), period 0 undiscounted.
+    period = out[PERIOD_TO_DISCOUNT].astype(int)
+    factor = np.where(period > 0, (1.0 + out[EIR].astype(float) / 12.0) ** (-period), 1.0)
+    out[DISCOUNTED_ECL] = out[CREDIT_LOSS] * factor
+    return out
+
+
+def compute_rows(
+    exposure: pd.DataFrame, lgd: pd.DataFrame, pd_curve: pd.DataFrame
+) -> tuple[pd.DataFrame, list[ExceptionLine]]:
+    """Row Detail for Steps 2-10, sorted by Loan ID then Snapshot Date."""
+    rows = project_exposure(exposure, lgd)
+    if rows.empty:
+        return pd.DataFrame(columns=ROW_COLUMNS), []
+    rows, exceptions = attach_pd(rows, pd_curve)
+    rows = compute_losses(rows)
+    rows = (
+        rows[ROW_COLUMNS]
+        .sort_values([LOAN_ID, SNAPSHOT_DATE], kind="mergesort")
         .reset_index(drop=True)
     )
-    snapshots = snapshots.drop(columns=["_grp"], errors="ignore")
-
-    # Step 8 — join PD results.
-    pd_lookup = pd_df[
-        [
-            "SEGMENT",
-            "Month",
-            "Transition",
-            "Marginal_PD",
-            "Cure_Rate",
-        ]
-    ].copy()
-    pd_lookup = pd_lookup.rename(
-        columns={
-            "Month": "Period Since Origination",
-            "Transition": "Staging",
-        }
-    )
-
-    snapshots = snapshots.merge(
-        pd_lookup,
-        on=["SEGMENT", "Period Since Origination", "Staging"],
-        how="left",
-    )
-
-    # EC-08 — hard fail if an entire segment has no PD data at all.
-    all_segs = set(snapshots["SEGMENT"].astype(str).unique())
-    segs_with_pd = set(
-        snapshots.loc[snapshots["Marginal_PD"].notna(), "SEGMENT"].astype(str).unique()
-    )
-    missing_segs = sorted(all_segs - segs_with_pd)
-    if missing_segs:
-        raise ValueError(
-            f"EC-08: No PD history for segment(s): {', '.join(missing_segs)}. "
-            "All segments present in the EAD file must have corresponding PD data. "
-            "Add these segments to the PD file and re-run."
-        )
-    # For snapshots beyond the PD horizon (months > 299), treat PD/cure as 0.
-    snapshots["Marginal_PD"] = snapshots["Marginal_PD"].fillna(0.0)
-    snapshots["Cure_Rate"] = snapshots["Cure_Rate"].fillna(0.0)
-
-    # Steps 9–11 — LGW, LGD, credit loss, discounted ECL.
-    bal_after_missed = snapshots["Balance After Missed Payment"].astype(float)
-    collateral = snapshots[_LGD_SUM_SHORT].astype(float)
-
-    # Math: LGW_t = max(1 - Collateral / EAD_t, 0)   [0 when EAD_t <= 0]
-    # Raw loss rate before accounting for the chance of curing: 100% minus
-    # however much of the balance the discounted collateral would cover.
-    lgw = np.where(
-        bal_after_missed <= 0,
-        0.0,
-        np.maximum(1.0 - collateral / bal_after_missed, 0.0),
-    )
-    snapshots["LGW"] = lgw
-
-    cure_rate = snapshots["Cure_Rate"].astype(float)
-    # Math: LGD_t = max(0, LGW_t x (1 - CureRate))
-    snapshots["LGD"] = np.maximum(0.0, snapshots["LGW"] * (1.0 - cure_rate))
-
-    marginal_pd = snapshots["Marginal_PD"].astype(float)
-    # Math: CreditLoss_t = EAD_t x PD_t x LGD_t
-    # The core IFRS9 Expected Credit Loss formula for one loan, one period:
-    # Expected Loss = Exposure at Default x Probability of Default x Loss
-    # Given Default. Everything computed above in this module and in
-    # pd_engine.py / lgd_engine.py exists to produce these three numbers.
-    snapshots["Credit Loss"] = bal_after_missed * marginal_pd * snapshots["LGD"].astype(float)
-
-    monthly_rate = snapshots["EIR"].astype(float) / 12.0
-    period_to_discount = snapshots["Period to be Discounted"].astype(int)
-    # Math: DiscountFactor_t = (1 + r)^(-t)   [r = EIR/12, t = months out]
-    # Stage 3 (already in default) is not discounted at all, matching
-    # PD.ipynb's calculate_discounted_ecl(), which returns raw Credit Loss
-    # for Stage 3 and only discounts Stage 1/2.
-    is_stage_3 = snapshots["Staging"] == "Stage 3"
-    discount_factor = np.where(
-        is_stage_3,
-        1.0,
-        np.where(
-            period_to_discount > 0,
-            (1.0 + monthly_rate) ** (-period_to_discount),
-            1.0,
-        ),
-    )
-    # Math: DiscountedECL_t = CreditLoss_t x DiscountFactor_t
-    # Present-value discount of the period's expected loss back to today, at
-    # the loan's own effective interest rate. This is the figure that is
-    # actually stored and reported per loan per snapshot period; summed
-    # across a loan's full horizon it gives that loan's Total ECL.
-    snapshots["Discounted ECL"] = snapshots["Credit Loss"] * discount_factor
-
-    decimal_cols = [
-        "Monthly Instalment",
-        "Balance After Repayment",
-        "Balance After Missed Payment",
-        "Credit Loss",
-        "Discounted ECL",
-        _LGD_SUM_SHORT,
-    ]
-    for col in decimal_cols:
-        if col in snapshots.columns:
-            snapshots[col] = snapshots[col].apply(_to_decimal)
-
-    output_cols = [
-        "Loan ID",
-        "Customer ID",
-        "SEGMENT",
-        "Staging",
-        "Snapshot Date",
-        "Period Since Origination",
-        "Period to be Discounted",
-        "Monthly Instalment",
-        "Balance After Repayment",
-        "Balance After Missed Payment",
-        _LGD_SUM_SHORT,
-        "Marginal PD",
-        "Cure Rate",
-        "LGW",
-        "LGD",
-        "Credit Loss",
-        "Discounted ECL",
-    ]
-    # Rename internal PD columns to display names for output.
-    if "Marginal_PD" in snapshots.columns and "Marginal PD" not in snapshots.columns:
-        snapshots = snapshots.rename(
-            columns={"Marginal_PD": "Marginal PD", "Cure_Rate": "Cure Rate"}
-        )
-
-    output = snapshots[output_cols].sort_values(
-        ["Loan ID", "Snapshot Date"],
-        kind="mergesort",
-    ).reset_index(drop=True)
-
-    return output, warnings
+    return rows, exceptions

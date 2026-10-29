@@ -31,16 +31,29 @@ INSERT INTO ead_results (
     id, run_id, tenant_id, loan_id, customer_id, segment, stage,
     snapshot_date, period_since_orig, period_to_discount,
     monthly_instalment, bal_after_repayment, bal_after_missed,
-    marginal_pd, lgw, lgd, credit_loss, discounted_ecl
+    marginal_pd, cure_rate, treatment, pd_rule, lgw, lgd, credit_loss, discounted_ecl
 ) VALUES (
     $1, $2, $3, $4, $5, $6, $7,
     $8, $9, $10,
     $11, $12, $13,
-    $14, $15, $16, $17, $18
+    $14, $15, $16, $17, $18, $19, $20, $21
 )
 """
 
-_LGD_SUM_COL = "Sum of Discounted Collaterals per Loan ID"
+_INSERT_LOAN_SUMMARY = """
+INSERT INTO ecl_loan_summaries (
+    id, run_id, tenant_id, loan_id, customer_id, segment, stage, reporting_date,
+    outstanding, discounted_collateral, ecl_before_cap, ecl_capped, total_ecl
+) VALUES ($1, $2, $3, $4, $5, $6, $7, $8, $9, $10, $11, $12, $13)
+"""
+
+_INSERT_EXCEPTION = """
+INSERT INTO run_exceptions (
+    id, run_id, tenant_id, seq, category, dataset, loan_id, customer_id, field, value, issue, action
+) VALUES ($1, $2, $3, $4, $5, $6, $7, $8, $9, $10, $11, $12)
+"""
+
+_LGD_SUM_COL = "Discounted Collateral"
 
 
 def _chunks(records: list[tuple[Any, ...]], size: int) -> list[list[tuple[Any, ...]]]:
@@ -97,40 +110,65 @@ def _lgd_records(run_id: str, tenant_id: str, df: pd.DataFrame) -> list[tuple[An
             tenant_id,
             str(row["Loan ID"]),
             str(row["Customer ID"]),
-            _to_decimal(row["EIR"]),
+            _to_decimal(row["Collateral EIR"]),
             _to_decimal(row[_LGD_SUM_COL]),
         )
         for row in df.to_dict(orient="records")
     ]
 
 
+def _optional_decimal(value: Any) -> Decimal | None:
+    return None if value is None or pd.isna(value) else _to_decimal(value)
+
+
 def _ead_records(run_id: str, tenant_id: str, df: pd.DataFrame) -> list[tuple[Any, ...]]:
-    records: list[tuple[Any, ...]] = []
-    for row in df.to_dict(orient="records"):
-        marginal_pd = row.get("Marginal PD")
-        records.append(
-            (
-                new_ulid(),
-                run_id,
-                tenant_id,
-                str(row["Loan ID"]),
-                str(row["Customer ID"]),
-                str(row["SEGMENT"]),
-                str(row["Staging"]),
-                _to_date(row["Snapshot Date"]),
-                int(row["Period Since Origination"]),
-                int(row["Period to be Discounted"]),
-                _to_decimal(row["Monthly Instalment"]),
-                _to_decimal(row["Balance After Repayment"]),
-                _to_decimal(row["Balance After Missed Payment"]),
-                None if marginal_pd is None or pd.isna(marginal_pd) else _to_decimal(marginal_pd),
-                _to_decimal(row["LGW"]),
-                _to_decimal(row["LGD"]),
-                _to_decimal(row["Credit Loss"]),
-                _to_decimal(row["Discounted ECL"]),
-            )
+    return [
+        (
+            new_ulid(),
+            run_id,
+            tenant_id,
+            str(row["Loan ID"]),
+            str(row["Customer ID"]),
+            str(row["SEGMENT"]),
+            str(row["Stage"]),
+            _to_date(row["Snapshot Date"]),
+            int(row["Period Since Origination"]),
+            int(row["Period to Be Discounted"]),
+            _to_decimal(row["Monthly Instalment"]),
+            _to_decimal(row["Balance After Repayment"]),
+            _to_decimal(row["Balance After Missed Payment"]),
+            _optional_decimal(row["Marginal PD"]),
+            _optional_decimal(row["Cure Rate"]),
+            str(row["Treatment"]),
+            str(row["PD Rule"]),
+            _to_decimal(row["LGW"]),
+            _to_decimal(row["LGD"]),
+            _to_decimal(row["Credit Loss"]),
+            _to_decimal(row["Discounted ECL"]),
         )
-    return records
+        for row in df.to_dict(orient="records")
+    ]
+
+
+def _loan_summary_records(run_id: str, tenant_id: str, df: pd.DataFrame) -> list[tuple[Any, ...]]:
+    return [
+        (
+            new_ulid(),
+            run_id,
+            tenant_id,
+            str(row["Loan ID"]),
+            str(row["Customer ID"]),
+            str(row["SEGMENT"]),
+            str(row["Stage"]),
+            _to_date(row["Reporting Date"]),
+            _to_decimal(row["Outstanding Amount"]),
+            _to_decimal(row["Discounted Collateral"]),
+            _to_decimal(row["ECL Before Cap"]),
+            row["ECL Capped"] == "Yes",
+            _to_decimal(row["Total ECL"]),
+        )
+        for row in df.to_dict(orient="records")
+    ]
 
 
 async def bulk_insert_pd_results(
@@ -161,3 +199,20 @@ async def bulk_insert_ead_results(
 ) -> int:
     """Insert EAD result rows in batches of 5,000."""
     return await _executemany(conn, _INSERT_EAD, _ead_records(run_id, tenant_id, df))
+
+
+async def bulk_insert_loan_summaries(
+    conn: AsyncConnection, run_id: str, tenant_id: str, df: pd.DataFrame
+) -> int:
+    return await _executemany(conn, _INSERT_LOAN_SUMMARY, _loan_summary_records(run_id, tenant_id, df))
+
+
+async def bulk_insert_exceptions(
+    conn: AsyncConnection, run_id: str, tenant_id: str, exceptions: list[Any]
+) -> int:
+    records = [
+        (new_ulid(), run_id, tenant_id, seq, e.category, e.dataset, e.loan_id or "", e.customer_id or "",
+         e.field, e.value or "", e.issue, e.action)
+        for seq, e in enumerate(exceptions)
+    ]
+    return await _executemany(conn, _INSERT_EXCEPTION, records)

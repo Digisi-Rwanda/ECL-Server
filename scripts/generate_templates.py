@@ -38,7 +38,6 @@ _FMT_CURRENCY = '#,##0.00'
 _FMT_DEC4     = '0.0000'
 
 _DV_STAGE = '"Stage 1,Stage 2,Stage 3"'
-_DV_FREQ  = '"MTH,QTR"'
 
 
 # ── Style helpers ──────────────────────────────────────────────────────────────
@@ -298,351 +297,112 @@ def _build_pd(wb: Workbook) -> None:
 
 
 # ── LGD template ──────────────────────────────────────────────────────────────
+def _spec_data_sheet(ws, headers: list[str], rows: list[list]) -> None:
+    ws.append(headers)
+    _style_header_row(ws, len(headers))
+    for row in rows:
+        ws.append(row)
+    _style_data_rows(ws, 2, len(rows) + 1, len(headers))
+    for i in range(1, len(headers) + 1):
+        _col_width(ws, i, 24)
+    ws.freeze_panes = "A2"
+
+
+def _spec_guide(ws, title: str, lines: list) -> None:
+    ws.append([title])
+    ws["A1"].font = _font(bold=True, size=14)
+    for line in lines:
+        ws.append(line if isinstance(line, list) else [line])
+        if isinstance(line, list) and line and line[0] == "Column Name":
+            for cell in ws[ws.max_row]:
+                cell.font = _font(bold=True)
+    for col, width in zip("ABCDE", (34, 14, 12, 26, 90), strict=True):
+        ws.column_dimensions[col].width = width
+    for row in ws.iter_rows():
+        for cell in row:
+            cell.alignment = _align(wrap=True)
+
+
 def _build_lgd(wb: Workbook) -> None:
+    """Collateral Dataset, ECL Calculation Specification v1.0 section 1.1."""
     ws = wb.active
     ws.title = "Data"
     ws.sheet_properties.tabColor = _TAB_LGD
-
-    headers = [
-        "Customer ID",
-        "Loan ID",
-        "Outstanding Amount",
-        "Effective Interest Rate (EIR)",
-        "Real Estate",
-        "Motor Vehicle",
-        "Cash Deposit",
-        "Corporate Guarantee",
-    ]
-    for c, h in enumerate(headers, 1):
-        ws.cell(row=1, column=c, value=h)
-
-    rows = [
-        # CustID       LoanID           OutAmt          EIR    Real Estate  Motor Veh  Cash Dep  Corp Guar
-        ("CUST-001", "LN-2025-0001",  490_000.00,  0.1400,  350_000.0,       0.0,       0.0,      0.0),
-        ("CUST-001", "LN-2025-0002",  748_000.00,  0.1400,        0.0,  250_000.0,       0.0,      0.0),
-        ("CUST-002", "LN-2025-0003", 3_100_000.00, 0.1200, 2_500_000.0,       0.0,       0.0, 800_000.0),
-        ("CUST-003", "LN-2025-0004", 1_060_000.00, 0.1600,  600_000.0,  180_000.0,       0.0,      0.0),
-        ("CUST-003", "LN-2025-0005",  860_000.00,  0.1600,        0.0,       0.0,  200_000.0,      0.0),
-        ("CUST-004", "LN-2025-0006", 1_250_000.00, 0.1300,  900_000.0,       0.0,       0.0,      0.0),
-        ("CUST-005", "LN-2025-0007",  425_000.00,  0.1500,        0.0,  120_000.0,       0.0,      0.0),
-        ("CUST-005", "LN-2025-0008",  980_000.00,  0.1500,  750_000.0,       0.0,       0.0, 100_000.0),
-        ("CUST-006", "LN-2025-0009", 2_200_000.00, 0.1100, 1_800_000.0,       0.0,  300_000.0,      0.0),
-        ("CUST-007", "LN-2025-0010",  630_000.00,  0.1700,        0.0,  200_000.0,       0.0,      0.0),
-    ]
-
-    for r, (cid, lid, out, eir, re, mv, cd, cg) in enumerate(rows, 2):
-        ws.cell(row=r, column=1, value=cid).alignment  = _align("center")
-        ws.cell(row=r, column=2, value=lid).alignment  = _align("center")
-        out_c = ws.cell(row=r, column=3, value=out)
-        out_c.number_format = _FMT_CURRENCY
-        out_c.alignment = _align("right")
-        eir_c = ws.cell(row=r, column=4, value=eir)
-        eir_c.number_format = _FMT_DEC4
-        eir_c.alignment = _align("center")
-        for col, val in zip(range(5, 9), [re, mv, cd, cg]):
-            c_cell = ws.cell(row=r, column=col, value=val)
-            c_cell.number_format = _FMT_CURRENCY
-            c_cell.alignment = _align("right")
-
-    _style_header_row(ws, 8)
-    _style_data_rows(ws, 2, 11, 8)
-    ws.freeze_panes = "A2"
-
-    for w, col in zip([16, 18, 22, 32, 16, 16, 14, 22], range(1, 9)):
-        _col_width(ws, col, w)
-
-    # Collateral Config sheet
-    ws_cc = wb.create_sheet("Collateral Config")
-    ws_cc.sheet_properties.tabColor = _TAB_LGD
-    ws_cc.column_dimensions["A"].width = 34
-    ws_cc.column_dimensions["B"].width = 58
-    ws_cc.column_dimensions["C"].width = 28
-
-    def _banner(row: int, text: str) -> None:
-        ws_cc.row_dimensions[row].height = 28
-        c = ws_cc.cell(row=row, column=1, value=text)
-        c.font      = _font(bold=True, size=13, color=_HDR_FG)
-        c.fill      = _fill(_HDR_BG)
-        c.alignment = _align("left")
-        ws_cc.merge_cells(f"A{row}:C{row}")
-
-    def _row(row: int, label: str, value: str, bold_label: bool = False) -> None:
-        ws_cc.row_dimensions[row].height = 36
-        lc = ws_cc.cell(row=row, column=1, value=label)
-        lc.font      = _font(bold=bold_label, size=10)
-        lc.fill      = _fill("EFF6FF")
-        lc.alignment = _align("left", wrap=True)
-        lc.border    = _thin_border()
-        vc = ws_cc.cell(row=row, column=2, value=value)
-        vc.font      = _font()
-        vc.fill      = _fill("FFFFFF")
-        vc.alignment = _align("left", wrap=True)
-        vc.border    = _thin_border()
-        blank = ws_cc.cell(row=row, column=3, value="")
-        blank.border = _thin_border()
-
-    _banner(1, "Collateral Configuration — Important Note")
-
-    _row(3,  "What are the collateral columns?",
-             "Columns E onward (Real Estate, Motor Vehicle …) represent the fair value of collateral "
-             "pledged against each loan.  Each column name must be an exact, case-sensitive match to a "
-             "Collateral Type name configured in your workspace (Workspace → Admin → Collateral Types).", True)
-    _row(4,  "How to configure Collateral Types",
-             "Navigate to Workspace → Admin → Collateral Types and create each category your portfolio uses.  "
-             "The 'Name' field you enter there must match the column header in this file exactly.")
-    _row(5,  "What is Haircut?",
-             "A percentage reduction applied to the collateral fair value to account for liquidation costs, "
-             "market discounts, and forced-sale risk.  E.g. a 20 % haircut on KES 1 000 000 gives "
-             "KES 800 000 recoverable before discounting.")
-    _row(6,  "What is Time to Realise?",
-             "The expected number of months to liquidate this collateral type.  Longer realisation periods "
-             "reduce present value because of the time-value-of-money discount applied.")
-    _row(7,  "Discount formula",
-             "For each collateral type:   Discounted Value = Fair Value × (1 − Haircut) × (1 + EIR) ^ (−Time_to_Realise)   "
-             "where EIR is the loan's effective interest rate (column D).")
-    _row(8,  "What if a collateral column is unrecognised?",
-             "Validation error EC-02 blocks the run.  Either remove the column or add the collateral type "
-             "in the admin screen so the system knows its haircut and time-to-realise values.")
-    _row(9,  "What if a loan has no collateral of a particular type?",
-             "Enter 0 (zero).  Blank cells are treated as 0 but may trigger a validation warning.  "
-             "Do not delete the column — all configured collateral type columns must be present.")
-
-    # Example table
-    ws_cc.row_dimensions[11].height = 22
-    ws_cc.cell(row=11, column=1, value="Example collateral types and typical IFRS 9 parameters").font = _font(bold=True)
-    for ci, lbl in enumerate(["Collateral Type Name", "Typical Haircut %", "Typical Time to Realise (months)"], 1):
-        c = ws_cc.cell(row=12, column=ci, value=lbl)
-        c.font      = _font(bold=True, size=10, color=_HDR_FG)
-        c.fill      = _fill(_HDR_BG)
-        c.alignment = _align("center")
-        c.border    = _header_border()
-        ws_cc.row_dimensions[12].height = 22
-
-    examples = [
-        ("Real Estate",           "20 %",  "18"),
-        ("Motor Vehicle",         "35 %",  "6"),
-        ("Cash Deposit",          "0 %",   "1"),
-        ("Corporate Guarantee",   "15 %",  "12"),
-        ("Government Securities", "5 %",   "3"),
-        ("Equipment / Machinery", "40 %",  "9"),
-    ]
-    for i, (name, hc, ttr) in enumerate(examples):
-        bg = _ALT_ROW if i % 2 == 0 else "FFFFFF"
-        for ci, val in enumerate([name, hc, ttr], 1):
-            c = ws_cc.cell(row=13 + i, column=ci, value=val)
-            c.fill      = _fill(bg)
-            c.font      = _font()
-            c.alignment = _align("center")
-            c.border    = _thin_border()
-
-    _make_instructions(
-        wb,
-        tab_color=_TAB_LGD,
-        title="Loss Given Default (LGD) — Upload Guide",
-        intro=(
-            "Upload one LGD file per run (single workbook, 25 MB max).  Each row represents one active loan.  "
-            "Collateral column names must exactly match the Collateral Types configured in your workspace.  "
-            "See the 'Collateral Config' sheet in this workbook for detailed guidance."
-        ),
-        col_rows=[
-            ("Customer ID",
-             "Yes", "Text", "Any non-empty string",
-             "A customer may have multiple loans.  Used for proportional collateral allocation: each loan's "
-             "share of a customer's total collateral = Outstanding Amount / Total Customer Outstanding.",
-             "CUST-001"),
-            ("Loan ID",
-             "Yes", "Text", "Unique per row",
-             "Must be unique within this file.  Primary key for LGD results.",
-             "LN-2025-0001"),
-            ("Outstanding Amount",
-             "Yes", "Number", "≥ 0",
-             "Current outstanding principal balance.  Used to weight collateral allocation across "
-             "loans belonging to the same customer.",
-             "490000.00"),
-            ("Effective Interest Rate (EIR)",
-             "Yes", "Number", "0 – 1  (decimal fraction)",
-             "Annual EIR expressed as a decimal, e.g. enter 0.14 for 14 %.  "
-             "Used as the discount rate in the collateral present-value formula (EC-05: must be 0 – 1).",
-             "0.14"),
-            ("[Collateral Type Name]",
-             "Yes*", "Number", "≥ 0",
-             "*One column per configured Collateral Type.  Column name must be an exact match (EC-02).  "
-             "Enter 0 if no collateral of this type is pledged for the loan.  "
-             "Amount represents fair value before haircut.",
-             "350000.00"),
-        ],
-        extra=[
-            ("Collateral discount formula (applied per type per loan)", [
-                "  Discounted Value = Fair Value  ×  (1 − Haircut)  ×  (1 + EIR) ^ (−Time_to_Realise_months)",
-                "  where:  Haircut and Time_to_Realise come from Workspace → Admin → Collateral Types.",
-                "          EIR comes from column D of this file.",
-                "",
-                "  The sum of discounted values across all collateral types = LGD recovery for that loan.",
-                "  LGD % = 1 − (Recovery Amount / Outstanding Amount)  [capped at 0 % – 100 %].",
-            ]),
+    _spec_data_sheet(
+        ws,
+        ["Customer ID", "Loan ID", "Outstanding Amount", "Effective Interest Rate (EIR)",
+         "Real Estate", "Motor Vehicle", "Cash Deposit", "Corporate Guarantee"],
+        [
+            ["CUST-001", "LN-2025-0001", 490000, 0.14, 350000, 250000, 0, 0],
+            ["CUST-001", "LN-2025-0002", 748000, 0.14, 350000, 250000, 0, 0],
+            ["CUST-002", "LN-2025-0003", 215000, 0.16, 0, 0, 40000, 100000],
         ],
     )
+    _spec_guide(wb.create_sheet("Instructions"), "Collateral Dataset (LGD) — ECL Calculation Specification v1.0", [
+        "One row per loan. Collateral is held at CUSTOMER level: when a customer has several loans, every one of "
+        "that customer's rows shows the customer's TOTAL collateral for each type (the same value repeated). The "
+        "engine splits it across the loans by each loan's share of the customer's exposure.",
+        [],
+        ["Column Name", "Required", "Type", "Allowed values", "Rule"],
+        ["Customer ID", "Yes", "Text", "Same as the EAD file", "A different Customer ID is logged and the EAD value is used."],
+        ["Loan ID", "Yes", "Text", "Unique, present in EAD", "Duplicates exclude the loan; Loan IDs not in the EAD file are ignored."],
+        ["Outstanding Amount", "Yes", "Number", "≥ 0", "Informational; allocation uses the EAD file's Outstanding Amount."],
+        ["Effective Interest Rate (EIR)", "Yes", "Number", "0 – 1 (decimal)", "Discount rate for collateral; if missing or invalid the EAD EIR is used."],
+        ["[Collateral type]", "One per type", "Number", "≥ 0", "Header must match a Collateral Type in Workspace → Collateral types. "
+         "Blank = 0. Negative or text = treated as 0. Different values for one customer → the lowest is used."],
+        [],
+        ["Formulas (spec Step 1)"],
+        ["Total Customer Exposure = Σ Outstanding Amount (EAD file) by Customer ID"],
+        ["Loan Proportion = Outstanding Amount / Total Customer Exposure"],
+        ["Allocated[type] = Loan Proportion × Collateral[type]"],
+        ["Discounted[type] = Allocated[type] × (1 − Haircut) × (1 + EIR)^(−Time to realize in years)"],
+        ["Discounted Collateral = Σ Discounted[type]"],
+        ["LGD = max(0, 1 − Discounted Collateral / EAD) × (1 − Cure Rate)"],
+        [],
+        ["Collateral parameters come from Workspace → Collateral types: haircut in %, time to realize in months "
+         "(converted to years). A collateral column without valid parameters counts as 0 and is reported."],
+    ])
 
 
-# ── EAD template ──────────────────────────────────────────────────────────────
 def _build_ead(wb: Workbook) -> None:
+    """Exposure Dataset, ECL Calculation Specification v1.0 section 1.3."""
     ws = wb.active
     ws.title = "Data"
     ws.sheet_properties.tabColor = _TAB_EAD
-
-    headers = [
-        "Loan ID",
-        "Customer ID",
-        "SEGMENT",
-        "Reporting Date",
-        "Maturity Date",
-        "Adjusted Maturity Date",
-        "First Payment Date",
-        "Outstanding Amount",
-        "Repayment Frequency",
-        "Staging",
-        "Effective Interest Rate (EIR)",
-    ]
-    for c, h in enumerate(headers, 1):
-        ws.cell(row=1, column=c, value=h)
-
-    _DATE_COLS = {4, 5, 6, 7}
-
-    rows = [
-        # LID           CID        SEG          RepDate       MatDate       AdjMat        FPDate        OutAmt         Freq    Stage     EIR
-        ("LN-2025-0001","CUST-001","Retail",    "2025-03-31","2029-03-31","2029-03-31","2022-04-30",  490_000.00, "MTH","Stage 1",0.1400),
-        ("LN-2025-0002","CUST-001","Retail",    "2025-03-31","2028-06-30","2028-06-30","2021-07-31",  748_000.00, "MTH","Stage 2",0.1400),
-        ("LN-2025-0003","CUST-002","Corporate", "2025-03-31","2030-12-31","2030-12-31","2023-01-31",3_100_000.00, "QTR","Stage 1",0.1200),
-        ("LN-2025-0004","CUST-003","SME",       "2025-03-31","2026-09-30","2026-09-30","2023-10-31",1_060_000.00, "MTH","Stage 3",0.1600),
-        ("LN-2025-0005","CUST-003","SME",       "2025-03-31","2027-03-31","2027-03-31","2022-04-30",  860_000.00, "MTH","Stage 1",0.1600),
-        ("LN-2025-0006","CUST-004","Retail",    "2025-03-31","2031-03-31","2031-03-31","2024-04-30",1_250_000.00, "MTH","Stage 1",0.1300),
-        ("LN-2025-0007","CUST-005","SME",       "2025-03-31","2026-03-31","2026-03-31","2023-04-30",  425_000.00, "QTR","Stage 2",0.1500),
-        ("LN-2025-0008","CUST-005","SME",       "2025-03-31","2028-09-30","2028-09-30","2022-10-31",  980_000.00, "MTH","Stage 1",0.1500),
-        ("LN-2025-0009","CUST-006","Corporate", "2025-03-31","2032-06-30","2032-06-30","2024-07-31",2_200_000.00, "QTR","Stage 1",0.1100),
-        ("LN-2025-0010","CUST-007","SME",       "2025-03-31","2027-09-30","2027-09-30","2023-10-31",  630_000.00, "MTH","Stage 2",0.1700),
-    ]
-
-    for r, row_data in enumerate(rows, 2):
-        for ci, val in enumerate(row_data, 1):
-            cell = ws.cell(row=r, column=ci, value=val)
-            if ci in _DATE_COLS:
-                cell.number_format = _FMT_DATE
-                cell.alignment     = _align("center")
-            elif ci == 8:
-                cell.number_format = _FMT_CURRENCY
-                cell.alignment     = _align("right")
-            elif ci == 11:
-                cell.number_format = _FMT_DEC4
-                cell.alignment     = _align("center")
-            elif ci in (9, 10):
-                cell.alignment = _align("center")
-            else:
-                cell.alignment = _align("center")
-
-    _style_header_row(ws, 11)
-    _style_data_rows(ws, 2, 11, 11)
-    ws.freeze_panes = "A2"
-
-    for w, col in zip([18, 14, 14, 18, 16, 24, 20, 22, 22, 14, 32], range(1, 12)):
-        _col_width(ws, col, w)
-
-    _add_dv(ws, _DV_FREQ,  "I2:I50000", "Repayment Frequency",
-            "MTH = Monthly  |  QTR = Quarterly")
-    _add_dv(ws, _DV_STAGE, "J2:J50000", "Staging",
-            "Stage 1 = performing  |  Stage 2 = SICR  |  Stage 3 = default")
-
-    _make_instructions(
-        wb,
-        tab_color=_TAB_EAD,
-        title="Exposure at Default (EAD) — Upload Guide",
-        intro=(
-            "Upload one EAD file per run (single workbook, 25 MB max).  Each row is one active loan at "
-            "the reporting date.  The engine performs a month-by-month forward balance walk (up to 299 months) "
-            "computing the expected outstanding balance at each future period, then discounts the resulting "
-            "ECL cash flows back to today."
-        ),
-        col_rows=[
-            ("Loan ID",
-             "Yes", "Text", "Unique, non-empty",
-             "Must be unique within this file.  Primary key for the EAD rundown and for joining "
-             "PD and LGD results at the loan level.",
-             "LN-2025-0001"),
-            ("Customer ID",
-             "Yes", "Text", "Non-empty string",
-             "Used to join LGD collateral data.  Must match the Customer ID in the LGD file.",
-             "CUST-001"),
-            ("SEGMENT",
-             "Yes", "Text", "Must match a configured segment",
-             "Case-sensitive match to a Segment name in Workspace → Admin → Segments.  "
-             "Used to look up the segment-level PD curve.",
-             "Retail"),
-            ("Reporting Date",
-             "Yes", "Date", "YYYY-MM-DD",
-             "The as-at snapshot date for this loan.  All other dates are validated relative to this.",
-             "2025-03-31"),
-            ("Maturity Date",
-             "Yes", "Date", "≥ Reporting Date",
-             "Contractual maturity date.  Must be on or after Reporting Date (EC-03).  "
-             "The rundown stops at this date.",
-             "2029-03-31"),
-            ("Adjusted Maturity Date",
-             "Yes", "Date", "≥ First Payment Date",
-             "Effective maturity after any restructuring or extensions.  "
-             "Must be on or after First Payment Date.",
-             "2029-03-31"),
-            ("First Payment Date",
-             "Yes", "Date", "≤ Reporting Date",
-             "Date of the first scheduled repayment.  Must be on or before Reporting Date (EC-04).  "
-             "Used to determine remaining loan term.",
-             "2022-04-30"),
-            ("Outstanding Amount",
-             "Yes", "Number", "≥ 0",
-             "Current outstanding principal balance at the reporting date.  "
-             "Seed value for the forward balance walk.",
-             "490000.00"),
-            ("Repayment Frequency",
-             "Yes", "Enum", "MTH  or  QTR",
-             "Payment schedule frequency.  MTH = monthly, QTR = quarterly.  "
-             "Other values trigger EC-09.  The balance walk always accrues monthly regardless.",
-             "MTH"),
-            ("Staging",
-             "Yes", "Enum", "Stage 1  /  Stage 2  /  Stage 3",
-             "IFRS 9 credit stage at the reporting date.  Determines which row of the segment PD "
-             "transition matrix is used for lifetime marginal PD.",
-             "Stage 1"),
-            ("Effective Interest Rate (EIR)",
-             "Yes", "Number", "0 – 1  (decimal fraction)",
-             "Annual EIR as a decimal, e.g. 0.14 for 14 %.  Used for (a) instalment calculation "
-             "and (b) ECL discounting (EC-05: must be in the range 0 – 1).",
-             "0.14"),
-        ],
-        extra=[
-            ("Cross-field date validation rules  (violations block the run)", [
-                "EC-03   Maturity Date  ≥  Reporting Date",
-                "        ✗  Reporting Date = 2025-03-31,  Maturity Date = 2024-12-31   ← maturity is in the past",
-                "        ✓  Reporting Date = 2025-03-31,  Maturity Date = 2029-03-31",
-                "",
-                "EC-04   First Payment Date  ≤  Reporting Date",
-                "        ✗  Reporting Date = 2025-03-31,  First Payment Date = 2025-06-30   ← first payment in the future",
-                "        ✓  Reporting Date = 2025-03-31,  First Payment Date = 2022-04-30",
-                "",
-                "        Adjusted Maturity Date  ≥  First Payment Date",
-                "        ✗  First Payment Date = 2022-04-30,  Adjusted Maturity Date = 2021-12-31",
-                "        ✓  First Payment Date = 2022-04-30,  Adjusted Maturity Date = 2029-03-31",
-            ]),
-            ("Balance walk and instalment calculation", [
-                "For MTH loans:  monthly instalment = PMT(EIR / 12, remaining_months, outstanding)",
-                "For QTR loans:  quarterly instalment = PMT(EIR / 4,  remaining_quarters, outstanding)",
-                "Monthly balance accrual always uses  EIR / 12  regardless of payment frequency.",
-                "Stage 3 loans accrue missed-payment interest into the balance at each forward step.",
-                "The rundown produces up to 299 monthly EAD snapshots per loan.",
-            ]),
-            ("Accepted aliases for column names", [
-                "Staging column also accepted as:   Staging (Stage)",
-                "EIR column also accepted as:       Effective Interest Rate   or   EIR",
-            ]),
+    _spec_data_sheet(
+        ws,
+        ["Loan ID", "Customer ID", "SEGMENT", "Reporting Date", "First Payment Date", "Maturity Date",
+         "Stage", "Outstanding Amount", "Effective Interest Rate (EIR)"],
+        [
+            ["LN-2025-0001", "CUST-001", "Retail", "2025-03-31", "2022-04-30", "2029-03-31", "Stage 1", 490000, 0.14],
+            ["LN-2025-0002", "CUST-001", "Retail", "2025-03-31", "2021-07-31", "2028-06-30", "Stage 2", 748000, 0.14],
+            ["LN-2025-0003", "CUST-002", "SME", "2025-03-31", "2020-01-31", "2026-12-31", "Stage 3", 215000, 0.16],
         ],
     )
+    _spec_guide(wb.create_sheet("Instructions"), "Exposure Dataset (EAD) — ECL Calculation Specification v1.0", [
+        "One row per loan, all at the run's Reporting Date. A loan that fails a rule below is excluded from the run "
+        "and listed in the Exception Report; it does not stop the run.",
+        [],
+        ["Column Name", "Required", "Type", "Allowed values", "Rule"],
+        ["Loan ID", "Yes", "Text", "Unique", "A Loan ID that appears more than once is excluded (all its rows)."],
+        ["Customer ID", "Yes", "Text", "Non-empty", "Groups loans for collateral allocation (Total Customer Exposure)."],
+        ["SEGMENT", "Yes", "Text", "Must have a PD curve", "Joins the PD term structure (SEGMENT, Month, Transition)."],
+        ["Reporting Date", "Yes", "Date", "= the run's Reporting Date", "Rows with another date are excluded."],
+        ["First Payment Date", "Yes", "Date", "≤ Reporting Date", "Period Since Origination = months between First Payment Date and each Snapshot Date."],
+        ["Maturity Date", "Yes", "Date", "≥ First Payment Date", "Adjusted Maturity Date = last day of this month (derived, do not supply)."],
+        ["Stage", "Yes", "Text", "Stage 1 / Stage 2 / Stage 3", "Also accepted as 'Staging' or 'Staging (Stage)'."],
+        ["Outstanding Amount", "Yes", "Number", "≥ 0", "Balance at the Reporting Date; ECL is capped at this amount."],
+        ["Effective Interest Rate (EIR)", "Yes", "Number", "0 – 1 (decimal)", "Annual rate, e.g. 0.14 for 14%. Above 1 is treated as a percentage mistake and excluded."],
+        [],
+        ["How exposure is projected"],
+        ["Stage 1: Reporting Date + 12 monthly rows (12 months of risk; the Reporting-Date row carries no PD)."],
+        ["Stage 2: monthly rows to the Adjusted Maturity Date (lifetime)."],
+        ["Stage 3, matured loans and zero-rate loans: a single row on the Outstanding Amount. Stage 3 Marginal PD = 100%."],
+        ["Instalment = Outstanding × r / (1 − (1 + r)^−n), r = EIR / 12, n = remaining months."],
+        ["Balance After Repayment: first row = Outstanding, then max(0, previous × (1 + r) − instalment)."],
+        ["EAD (Balance After Missed Payment) = Balance After Repayment[t − k] × (1 + r)^k, k = min(t, 3)."],
+        ["Older templates' 'Adjusted Maturity Date' and 'Repayment Frequency' columns are ignored (monthly instalments)."],
+    ])
 
 
 # ── Entry point ───────────────────────────────────────────────────────────────
