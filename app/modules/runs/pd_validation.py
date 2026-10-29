@@ -15,6 +15,7 @@ snapshot of the numbers.
 
 from __future__ import annotations
 
+import asyncio
 import hashlib
 from decimal import Decimal
 
@@ -141,7 +142,7 @@ async def _load_pd_sources(uploads: list[Upload]) -> list[PdSourceSheet]:
     for upload in uploads:
         content = await download_bytes(upload.storage_path)
         try:
-            sheets, _sheet_count, _row_count = _parse_excel(content)
+            sheets, _sheet_count, _row_count = await asyncio.to_thread(_parse_excel, content)
         except Exception as exc:
             raise ECLException(
                 "INVALID_FILE",
@@ -311,7 +312,9 @@ async def validate_pd_files(
 
     thresholds, _row = await resolve_pd_thresholds(db, tenant_id)
 
-    outcome = evaluate_pd_validation(
+    # CPU-bound (parsing checks + 299 matrix powers per segment): off the event loop.
+    outcome = await asyncio.to_thread(
+        evaluate_pd_validation,
         sources,
         allowed_segments=allowed_segments,
         thresholds=thresholds,

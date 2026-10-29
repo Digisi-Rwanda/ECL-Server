@@ -8,6 +8,7 @@ upload status and two audit events. The checklist runs the same
 
 from __future__ import annotations
 
+import asyncio
 from collections import Counter
 from typing import Any
 
@@ -39,7 +40,7 @@ from app.engine.lgd_engine import (
 )
 from app.engine.pd_engine import compute_pd, is_pd_data_sheet, prepare_pd_frame
 from app.engine.validators.ecl_criteria import evaluate_ead, evaluate_lgd
-from app.engine.workbook import frames_from_workbooks
+from app.engine.workbook import _key, frames_from_workbooks
 from app.modules.audit.models import AuditEvent
 from app.modules.audit.service import log_event
 from app.modules.runs.models import Upload
@@ -103,7 +104,7 @@ async def _frame(uploads: list[Upload], keep) -> pd.DataFrame:
         return pd.DataFrame()
     try:
         files = [await download_bytes(u.storage_path) for u in uploads]
-        return frames_from_workbooks(files, keep_sheet=keep)
+        return await asyncio.to_thread(frames_from_workbooks, files, keep)
     except Exception as exc:
         raise ECLException(
             "UNREADABLE_WORKBOOK", f"Could not read {uploads[0].original_filename}: {exc}", 400
@@ -118,7 +119,7 @@ async def _pd_inputs(db: AsyncSession, run, *, curve: bool) -> tuple[pd.DataFram
     frame = await _frame(uploads, is_pd_data_sheet)
     if frame.empty:
         return frame, None
-    return frame, (compute_pd(frame)[0] if curve else None)
+    return frame, ((await asyncio.to_thread(compute_pd, frame))[0] if curve else None)
 
 
 def _exception_out(e: ExceptionLine) -> ExceptionOut:
@@ -194,7 +195,8 @@ async def validate_lgd_files(
     pd_ids = set(pd_frame["Loan ID"].dropna().astype(str).str.strip()) if "Loan ID" in pd_frame else set()
     config = await collateral_parameters(db, tenant_id)
 
-    outcome = evaluate_lgd(
+    outcome = await asyncio.to_thread(
+        evaluate_lgd,
         collateral, config,
         exposure=exposure if exposure is not None and not exposure.empty else None,
         pd_loan_ids=pd_ids, engine_version=ENGINE_VERSION,
@@ -202,12 +204,12 @@ async def validate_lgd_files(
     preview = None
     if outcome.status != "blocking" or not outcome.lgd.empty:
         prepared, lgd = outcome.prepared, outcome.lgd
-        by_name = {c["name"]: c for c in config}
+        by_name = {_key(c["name"]): c for c in config}
         params = [
             CollateralParameterOut(
                 name=t,
-                haircut=by_name[t]["haircut"] if t in by_name else None,
-                years=by_name[t]["time_to_realize"] if t in by_name else None,
+                haircut=by_name[_key(t)]["haircut"] if _key(t) in by_name else None,
+                years=by_name[_key(t)]["time_to_realize"] if _key(t) in by_name else None,
                 valid=t in prepared.parameters,
             )
             for t in prepared.collateral_types
@@ -359,7 +361,8 @@ async def build_ead_validation(db: AsyncSession, run, tenant_id: str):
     if curve is None:
         raise ECLException("NO_PD_UPLOADS", "Upload and validate PD before EAD.", 400)
     config = await collateral_parameters(db, tenant_id)
-    outcome = evaluate_ead(
+    outcome = await asyncio.to_thread(
+        evaluate_ead,
         exposure, collateral, config, curve,
         pd_latest=_pd_latest(pd_frame), run_reporting_date=run.reporting_date,
         engine_version=ENGINE_VERSION,
@@ -376,7 +379,11 @@ async def validate_ead_files(
     run = await _get_run(db, tenant_id, run_id)
     await _started(db, run_id=run_id, user_id=user_id, scope="ead", ip=ip, user_agent=user_agent)
     outcome, ead_uploads = await build_ead_validation(db, run, tenant_id)
-    preview = ead_preview(outcome.run, outcome.reporting_date_source) if outcome.run else None
+    preview = (
+        await asyncio.to_thread(ead_preview, outcome.run, outcome.reporting_date_source)
+        if outcome.run
+        else None
+    )
     await _record(db, ead_uploads, outcome.status, run_id=run_id, user_id=user_id, scope="ead",
                   criteria=outcome.criteria, ip=ip, user_agent=user_agent)
     log.info("ead_validate_complete", run_id=run_id, status=outcome.status,
@@ -410,7 +417,8 @@ async def build_ecl_preview_export(db: AsyncSession, tenant_id: str, run_id: str
                     "modified": max(u.created_at for u in ead_uploads).strftime("%Y-%m-%d %H:%M UTC"),
                     "rows": outcome.run.prepared.exposure_rows_in}],
     }
-    return build_loan_detail_workbook(outcome.run, meta), f"Preview - {LOAN_DETAIL_FILENAME}"
+    content = await asyncio.to_thread(build_loan_detail_workbook, outcome.run, meta)
+    return content, f"Preview - {LOAN_DETAIL_FILENAME}"
 
 
 async def accept_review(db: AsyncSession, tenant_id: str, run_id: str, user_id: str, kind: str) -> AcceptReviewOut:

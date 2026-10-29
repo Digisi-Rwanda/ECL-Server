@@ -2,6 +2,7 @@
 
 from __future__ import annotations
 
+import asyncio
 import hashlib
 import io
 import zipfile
@@ -759,10 +760,21 @@ async def upload_file(
         )
     log.info("upload_stored", run_id=run_id, kind=kind, size_bytes=size, sha256_prefix=sha256[:8])
 
-    content = await download_bytes(storage_path)
+    # upload_stream already read the file; read it again from the local spool
+    # rather than downloading what was just uploaded.
+    file_obj.seek(0)
+    content = file_obj.read()
     _assert_upload_safe(content, content_type)
     log.info("upload_parsing_excel", run_id=run_id, kind=kind, filename=filename)
-    sheets, sheet_count, row_count = _parse_excel(content)
+    try:
+        # Parsing is CPU-bound; off the event loop so the API keeps answering.
+        sheets, sheet_count, row_count = await asyncio.to_thread(_parse_excel, content)
+    except Exception as exc:
+        await delete_object(storage_path)
+        raise ECLException(
+            "INVALID_FILE", f"'{filename}' could not be read as an Excel workbook.", 422
+        ) from exc
+    del sheets
     log.info("upload_parsed", run_id=run_id, kind=kind, sheets=sheet_count, rows=row_count)
 
     if row_count is not None and row_count > 1_000_000:

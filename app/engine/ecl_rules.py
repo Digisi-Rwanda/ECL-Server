@@ -15,6 +15,8 @@ from datetime import date
 
 import pandas as pd
 
+from app.engine.workbook import _key
+
 STAGES = ("Stage 1", "Stage 2", "Stage 3")
 
 LOAN_ID = "Loan ID"
@@ -202,10 +204,11 @@ def _exposure_failures(
 def _parameters(
     collateral_types: list[str], config: list[dict[str, object]], exceptions: list[ExceptionLine]
 ) -> dict[str, dict[str, float]]:
-    by_name = {str(c["name"]).strip(): c for c in config}
+    # "real estate" in the file matches the workspace type "Real Estate".
+    by_name = {_key(str(c["name"])): c for c in config}
     valid: dict[str, dict[str, float]] = {}
     for name in collateral_types:
-        cfg = by_name.get(name)
+        cfg = by_name.get(_key(name))
         if cfg is None:
             exceptions.append(
                 ExceptionLine(
