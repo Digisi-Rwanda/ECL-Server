@@ -2,7 +2,8 @@
 
 from __future__ import annotations
 
-from sqlalchemy import delete, select
+from sqlalchemy import select
+from sqlalchemy.dialects.postgresql import insert as pg_insert
 from sqlalchemy.exc import ProgrammingError
 from sqlalchemy.ext.asyncio import AsyncSession
 
@@ -41,21 +42,29 @@ async def persist_pd_observation_payload(
     engine_version: str,
     payload: dict,
 ) -> PdObservationSnapshot:
+    # Upsert, not delete+insert: overlapping PD tasks for one run (Celery
+    # redelivery, double execute) otherwise race on the unique run_id.
+    stmt = (
+        pg_insert(PdObservationSnapshot)
+        .values(
+            id=new_ulid(),
+            run_id=run_id,
+            tenant_id=tenant_id,
+            engine_version=engine_version,
+            payload=payload,
+        )
+        .on_conflict_do_update(
+            index_elements=[PdObservationSnapshot.run_id],
+            set_={"tenant_id": tenant_id, "engine_version": engine_version, "payload": payload},
+        )
+        .returning(PdObservationSnapshot)
+    )
     try:
-        await db.execute(delete(PdObservationSnapshot).where(PdObservationSnapshot.run_id == run_id))
+        result = await db.execute(stmt)
     except ProgrammingError:
         await db.rollback()
         raise
-    row = PdObservationSnapshot(
-        id=new_ulid(),
-        run_id=run_id,
-        tenant_id=tenant_id,
-        engine_version=engine_version,
-        payload=payload,
-    )
-    db.add(row)
-    await db.flush()
-    return row
+    return result.scalar_one()
 
 
 async def load_pd_observation(db: AsyncSession, run_id: str) -> PdPreviewOut | None:
