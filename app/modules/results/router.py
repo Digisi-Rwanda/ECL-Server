@@ -8,6 +8,7 @@ from app.modules.results.schemas import (
     PortfolioResponse,
     SegmentResponse,
 )
+from app.modules.runs.schemas import EclReportResponse, ExceptionsPageResponse
 from app.modules.tenants.models import TenantMembership
 
 router = APIRouter(prefix="/tenants", tags=["results"])
@@ -81,3 +82,33 @@ async def get_loan_endpoint(
         db, tenant_id, loan_id, run_id=run_id, user=user, membership=membership
     )
     return LoanResponse(data=data)
+
+
+@router.get("/{tenant_id}/runs/{run_id}/ecl-report")
+async def get_ecl_report_endpoint(
+    tenant_id: str,
+    run_id: str,
+    db: DbSession,
+    user: CurrentUser,
+    membership: TenantMembership = Depends(require_tenant_member),
+) -> EclReportResponse:
+    data = await service.get_ecl_report(db, tenant_id, run_id, user=user, membership=membership)
+    return EclReportResponse(data=data)
+
+
+@router.get("/{tenant_id}/runs/{run_id}/exceptions")
+async def list_run_exceptions_endpoint(
+    tenant_id: str,
+    run_id: str,
+    db: DbSession,
+    user: CurrentUser,
+    membership: TenantMembership = Depends(require_tenant_member),
+    category: str | None = Query(default=None),
+    page: int = Query(default=1, ge=1),
+    per_page: int = Query(default=50, ge=1, le=200),
+) -> ExceptionsPageResponse:
+    data = await service.list_run_exceptions(
+        db, tenant_id, run_id, category=category, page=page, per_page=per_page,
+        user=user, membership=membership,
+    )
+    return ExceptionsPageResponse(data=data)

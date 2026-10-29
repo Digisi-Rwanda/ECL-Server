@@ -21,7 +21,7 @@ from app.engine.format_utils import (
 )
 from app.modules.auth.models import User
 from app.modules.auth.utils import user_initials
-from app.modules.results.models import EadResult, LgdResult, PdResult
+from app.modules.results.models import EadResult, EclLoanSummary, LgdResult, PdResult
 from app.modules.results.pd_observation import (
     load_pd_observation,
     persist_pd_observation_payload,
@@ -47,6 +47,14 @@ from app.modules.results.schemas import (
     TrendPointOut,
 )
 from app.modules.runs.models import Run
+from app.modules.runs.schemas import (
+    EclReportOut,
+    EclTotalsOut,
+    ExceptionOut,
+    ExceptionsPageOut,
+    ReconciliationOut,
+    SummaryRowOut,
+)
 from app.modules.runs.service import assert_run_visible, get_run_scope_filter
 from app.modules.tenants.models import Tenant, TenantMembership
 
@@ -183,27 +191,25 @@ async def _previous_completed_run(
 
 async def _loan_count(db: AsyncSession, run_id: str, tenant_id: str) -> int:
     result = await db.execute(
-        select(func.count(func.distinct(EadResult.loan_id))).where(
-            EadResult.run_id == run_id,
-            EadResult.tenant_id == tenant_id,
+        select(func.count()).where(
+            EclLoanSummary.run_id == run_id,
+            EclLoanSummary.tenant_id == tenant_id,
         )
     )
     return int(result.scalar_one() or 0)
 
 
-def _apply_min_ecl_filter(
-    base_filter: list,
-    min_ecl: float | None,
+def _summary_filter(
+    run_id: str, tenant_id: str, *, stage: str | None = None, min_ecl: float | None = None
 ) -> list:
-    if min_ecl is None:
-        return base_filter
-    eligible = (
-        select(EadResult.loan_id)
-        .where(*base_filter)
-        .group_by(EadResult.loan_id)
-        .having(func.sum(EadResult.discounted_ecl) >= min_ecl)
-    )
-    return [*base_filter, EadResult.loan_id.in_(eligible)]
+    # Every ECL figure reads the capped loan-level Total ECL (spec Step 11),
+    # never a sum of ead_results rows, which are uncapped.
+    base = [EclLoanSummary.run_id == run_id, EclLoanSummary.tenant_id == tenant_id]
+    if stage:
+        base.append(EclLoanSummary.stage == stage)
+    if min_ecl is not None:
+        base.append(EclLoanSummary.total_ecl >= min_ecl)
+    return base
 
 
 async def _segment_aggregates(
@@ -215,102 +221,40 @@ async def _segment_aggregates(
     stage: str | None = None,
     min_ecl: float | None = None,
 ) -> list[SegmentDataOut]:
-    base_filter = [EadResult.run_id == run_id, EadResult.tenant_id == tenant_id]
-    if stage:
-        base_filter.append(EadResult.stage == stage)
-    base_filter = _apply_min_ecl_filter(base_filter, min_ecl)
-
-    ecl_sub = (
+    base_filter = _summary_filter(run_id, tenant_id, stage=stage, min_ecl=min_ecl)
+    segments_result = await db.execute(
         select(
-            EadResult.segment.label("segment"),
-            func.sum(EadResult.discounted_ecl).label("ecl"),
+            EclLoanSummary.segment,
+            func.sum(EclLoanSummary.total_ecl).label("ecl"),
+            func.sum(EclLoanSummary.outstanding).label("outstanding"),
+            func.count().label("loans"),
         )
         .where(*base_filter)
-        .group_by(EadResult.segment)
-        .subquery()
+        .group_by(EclLoanSummary.segment)
+        .order_by(func.sum(EclLoanSummary.total_ecl).desc())
     )
-
-    outstanding_sub = (
-        select(
-            EadResult.segment.label("segment"),
-            EadResult.loan_id.label("loan_id"),
-            func.max(EadResult.bal_after_missed).label("ead_max"),
-        )
+    stage_result = await db.execute(
+        select(EclLoanSummary.segment, EclLoanSummary.stage, func.count())
         .where(*base_filter)
-        .group_by(EadResult.segment, EadResult.loan_id)
-        .subquery()
+        .group_by(EclLoanSummary.segment, EclLoanSummary.stage)
     )
-
-    outstanding_agg = (
-        select(
-            outstanding_sub.c.segment,
-            func.sum(outstanding_sub.c.ead_max).label("outstanding"),
-            func.count(outstanding_sub.c.loan_id).label("loans"),
-        )
-        .group_by(outstanding_sub.c.segment)
-        .subquery()
-    )
-
-    stage_sub = (
-        select(
-            EadResult.segment.label("segment"),
-            EadResult.loan_id.label("loan_id"),
-            func.min(EadResult.period_to_discount).label("min_period"),
-        )
-        .where(*base_filter)
-        .group_by(EadResult.segment, EadResult.loan_id)
-        .subquery()
-    )
-
-    initial_stage = (
-        select(
-            EadResult.segment.label("segment"),
-            EadResult.stage.label("stage"),
-            func.count(func.distinct(EadResult.loan_id)).label("cnt"),
-        )
-        .join(
-            stage_sub,
-            (EadResult.segment == stage_sub.c.segment)
-            & (EadResult.loan_id == stage_sub.c.loan_id)
-            & (EadResult.period_to_discount == stage_sub.c.min_period),
-        )
-        .where(*base_filter)
-        .group_by(EadResult.segment, EadResult.stage)
-        .subquery()
-    )
+    stage_counts: dict[str, dict[str, int]] = {}
+    for seg, stg, cnt in stage_result.all():
+        stage_counts.setdefault(seg, {})[stg] = int(cnt)
 
     prior_ecl: dict[str, float] = {}
     if prior_run_id:
         prior_result = await db.execute(
-            select(EadResult.segment, func.sum(EadResult.discounted_ecl))
-            .where(EadResult.run_id == prior_run_id, EadResult.tenant_id == tenant_id)
-            .group_by(EadResult.segment)
+            select(EclLoanSummary.segment, func.sum(EclLoanSummary.total_ecl))
+            .where(*_summary_filter(prior_run_id, tenant_id))
+            .group_by(EclLoanSummary.segment)
         )
         prior_ecl = {row[0]: float(row[1] or 0) for row in prior_result.all()}
-
-    segments_result = await db.execute(
-        select(
-            ecl_sub.c.segment,
-            ecl_sub.c.ecl,
-            outstanding_agg.c.outstanding,
-            outstanding_agg.c.loans,
-        )
-        .join(outstanding_agg, ecl_sub.c.segment == outstanding_agg.c.segment)
-        .order_by(ecl_sub.c.ecl.desc())
-    )
-
-    stage_result = await db.execute(
-        select(initial_stage.c.segment, initial_stage.c.stage, initial_stage.c.cnt)
-    )
-    stage_counts: dict[str, dict[str, int]] = {}
-    for seg, stage, cnt in stage_result.all():
-        stage_counts.setdefault(seg, {})[stage] = int(cnt)
 
     segments: list[SegmentDataOut] = []
     for row in segments_result.all():
         ecl = float(row.ecl or 0)
         outstanding = float(row.outstanding or 0)
-        loans = int(row.loans or 0)
         coverage = format_coverage(ecl / outstanding) if outstanding else "0.00%"
         counts = stage_counts.get(row.segment, {})
         total = sum(counts.values()) or 1
@@ -319,8 +263,6 @@ async def _segment_aggregates(
             round(counts.get("Stage 2", 0) / total * 100, 1),
             round(counts.get("Stage 3", 0) / total * 100, 1),
         )
-        prior = prior_ecl.get(row.segment)
-        delta = _pct_delta(ecl, prior) or 0.0
         segments.append(
             SegmentDataOut(
                 name=row.segment,
@@ -328,11 +270,29 @@ async def _segment_aggregates(
                 ecl=ecl,
                 outstanding=outstanding,
                 coverage=coverage,
-                loans=loans,
-                delta=delta,
+                loans=int(row.loans or 0),
+                delta=_pct_delta(ecl, prior_ecl.get(row.segment)) or 0.0,
             )
         )
     return segments
+
+
+def _pd_12m_subquery(run_id: str, tenant_id: str):
+    # Months 1-12 after the Reporting Date; the reporting-date row carries no PD.
+    return (
+        select(
+            EadResult.loan_id,
+            func.coalesce(func.sum(EadResult.marginal_pd), 0).label("pd_12m"),
+            func.avg(EadResult.lgd).label("lgd"),
+        )
+        .where(
+            EadResult.run_id == run_id,
+            EadResult.tenant_id == tenant_id,
+            EadResult.period_to_discount <= 12,
+        )
+        .group_by(EadResult.loan_id)
+        .subquery()
+    )
 
 
 async def _loan_rows_for_segment(
@@ -347,97 +307,40 @@ async def _loan_rows_for_segment(
     min_ecl: float | None = None,
 ) -> tuple[list[LoanRowOut], int]:
     seg_filter = [
-        EadResult.run_id == run_id,
-        EadResult.tenant_id == tenant_id,
-        EadResult.segment == segment_name,
+        *_summary_filter(run_id, tenant_id, stage=stage, min_ecl=min_ecl),
+        EclLoanSummary.segment == segment_name,
     ]
-    if stage:
-        seg_filter.append(EadResult.stage == stage)
-    seg_filter = _apply_min_ecl_filter(seg_filter, min_ecl)
+    total = (await db.execute(select(func.count()).where(*seg_filter))).scalar_one()
 
-    ecl_group = (
-        select(
-            EadResult.loan_id,
-            EadResult.customer_id,
-            func.sum(EadResult.discounted_ecl).label("ecl"),
-            func.max(EadResult.bal_after_missed).label("ead"),
-            func.avg(EadResult.lgd).label("lgd"),
-        )
-        .where(*seg_filter)
-        .group_by(EadResult.loan_id, EadResult.customer_id)
-    )
-    if min_ecl is not None:
-        ecl_group = ecl_group.having(func.sum(EadResult.discounted_ecl) >= min_ecl)
-    ecl_sub = ecl_group.subquery()
-
-    stage_sub = (
-        select(
-            EadResult.loan_id,
-            func.min(EadResult.period_to_discount).label("min_period"),
-        )
-        .where(*seg_filter)
-        .group_by(EadResult.loan_id)
-        .subquery()
-    )
-
-    initial_stage = (
-        select(EadResult.loan_id, EadResult.stage)
-        .join(
-            stage_sub,
-            (EadResult.loan_id == stage_sub.c.loan_id)
-            & (EadResult.period_to_discount == stage_sub.c.min_period),
-        )
-        .where(*seg_filter)
-        .subquery()
-    )
-
-    pd_sub = (
-        select(
-            EadResult.loan_id,
-            func.coalesce(func.sum(EadResult.marginal_pd), 0).label("pd_12m"),
-        )
-        .where(
-            *seg_filter,
-            EadResult.period_to_discount <= 12,
-        )
-        .group_by(EadResult.loan_id)
-        .subquery()
-    )
-
-    count_q = select(func.count()).select_from(ecl_sub)
-    total = (await db.execute(count_q)).scalar_one()
-
-    offset = (page - 1) * per_page
+    rates = _pd_12m_subquery(run_id, tenant_id)
     result = await db.execute(
         select(
-            ecl_sub.c.loan_id,
-            ecl_sub.c.customer_id,
-            ecl_sub.c.ecl,
-            ecl_sub.c.ead,
-            ecl_sub.c.lgd,
-            initial_stage.c.stage,
-            pd_sub.c.pd_12m,
+            EclLoanSummary.loan_id,
+            EclLoanSummary.customer_id,
+            EclLoanSummary.stage,
+            EclLoanSummary.total_ecl,
+            EclLoanSummary.outstanding,
+            rates.c.pd_12m,
+            rates.c.lgd,
         )
-        .outerjoin(initial_stage, ecl_sub.c.loan_id == initial_stage.c.loan_id)
-        .outerjoin(pd_sub, ecl_sub.c.loan_id == pd_sub.c.loan_id)
-        .order_by(ecl_sub.c.ecl.desc())
-        .offset(offset)
+        .outerjoin(rates, EclLoanSummary.loan_id == rates.c.loan_id)
+        .where(*seg_filter)
+        .order_by(EclLoanSummary.total_ecl.desc(), EclLoanSummary.loan_id)
+        .offset((page - 1) * per_page)
         .limit(per_page)
     )
-
-    loans: list[LoanRowOut] = []
-    for row in result.all():
-        loans.append(
-            LoanRowOut(
-                id=row.loan_id,
-                customer=row.customer_id,
-                stage=_stage_num(row.stage or "Stage 1"),
-                pd=round(float(row.pd_12m or 0) * 100, 2),
-                lgd=round(float(row.lgd or 0) * 100, 2),
-                ead=round(float(row.ead or 0)),
-                ecl=round(float(row.ecl or 0)),
-            )
+    loans = [
+        LoanRowOut(
+            id=row.loan_id,
+            customer=row.customer_id,
+            stage=_stage_num(row.stage),
+            pd=round(float(row.pd_12m or 0) * 100, 2),
+            lgd=round(float(row.lgd or 0) * 100, 2),
+            ead=round(float(row.outstanding or 0)),
+            ecl=round(float(row.total_ecl or 0)),
         )
+        for row in result.all()
+    ]
     return loans, total
 
 
@@ -575,27 +478,10 @@ async def get_dashboard(
         SegmentBarDashboardOut(name=s.name, value=s.ecl) for s in segment_data[:6]
     ]
 
-    stage_sub = (
-        select(
-            EadResult.loan_id.label("loan_id"),
-            func.min(EadResult.period_to_discount).label("min_period"),
-        )
-        .where(EadResult.run_id == latest.id, EadResult.tenant_id == tenant_id)
-        .group_by(EadResult.loan_id)
-        .subquery()
-    )
-    initial_stage = (
-        select(EadResult.stage)
-        .join(
-            stage_sub,
-            (EadResult.loan_id == stage_sub.c.loan_id)
-            & (EadResult.period_to_discount == stage_sub.c.min_period),
-        )
-        .where(EadResult.run_id == latest.id, EadResult.tenant_id == tenant_id)
-        .subquery()
-    )
     stage_result = await db.execute(
-        select(initial_stage.c.stage, func.count()).group_by(initial_stage.c.stage)
+        select(EclLoanSummary.stage, func.count())
+        .where(*_summary_filter(latest.id, tenant_id))
+        .group_by(EclLoanSummary.stage)
     )
     stage_counts = {stage: int(cnt) for stage, cnt in stage_result.all()}
     total_stages = sum(stage_counts.values()) or 1
@@ -865,44 +751,19 @@ async def get_loan(
     tenant = await _get_tenant(db, tenant_id)
     run = await _latest_completed_run(db, tenant_id, run_id, user=user, membership=membership)
 
-    agg_result = await db.execute(
-        select(
-            func.sum(EadResult.discounted_ecl).label("ecl"),
-            func.max(EadResult.bal_after_missed).label("ead"),
-            func.avg(EadResult.lgd).label("lgd"),
-            func.max(EadResult.segment).label("segment"),
-            func.max(EadResult.customer_id).label("customer"),
-        ).where(
-            EadResult.run_id == run.id,
-            EadResult.tenant_id == tenant_id,
-            EadResult.loan_id == loan_id,
+    summary = (
+        await db.execute(
+            select(EclLoanSummary).where(
+                *_summary_filter(run.id, tenant_id), EclLoanSummary.loan_id == loan_id
+            )
         )
-    )
-    agg = agg_result.one_or_none()
-    if not agg or agg.ecl is None:
+    ).scalar_one_or_none()
+    if summary is None:
         raise ECLException("RESOURCE_NOT_FOUND", f"Loan '{loan_id}' not found.", 404)
-
-    stage_result = await db.execute(
-        select(EadResult.stage)
-        .where(
-            EadResult.run_id == run.id,
-            EadResult.tenant_id == tenant_id,
-            EadResult.loan_id == loan_id,
-        )
-        .order_by(EadResult.period_to_discount.asc())
-        .limit(1)
-    )
-    initial_stage = stage_result.scalar_one_or_none() or "Stage 1"
-
-    pd_result = await db.execute(
-        select(func.coalesce(func.sum(EadResult.marginal_pd), 0)).where(
-            EadResult.run_id == run.id,
-            EadResult.tenant_id == tenant_id,
-            EadResult.loan_id == loan_id,
-            EadResult.period_to_discount <= 12,
-        )
-    )
-    pd_12m = float(pd_result.scalar_one() or 0)
+    rates = _pd_12m_subquery(run.id, tenant_id)
+    rates_row = (await db.execute(select(rates).where(rates.c.loan_id == loan_id))).one_or_none()
+    pd_12m = float(rates_row.pd_12m or 0) if rates_row else 0.0
+    avg_lgd = float(rates_row.lgd or 0) if rates_row else 0.0
 
     lgd_result = await db.execute(
         select(func.coalesce(func.sum(LgdResult.sum_discounted_collat), 0)).where(
@@ -946,16 +807,16 @@ async def get_loan(
     if last_snapshot:
         maturity = f"{last_snapshot.strftime('%b %Y')} · {max_period} mo"
 
-    ead_val = round(float(agg.ead or 0))
+    ead_val = round(float(summary.outstanding))
     return LoanViewOut(
         id=loan_id,
-        customer=agg.customer or "",
-        stage=_stage_num(initial_stage),
+        customer=summary.customer_id,
+        stage=_stage_num(summary.stage),
         pd=round(pd_12m * 100, 2),
-        lgd=round(float(agg.lgd or 0) * 100, 2),
+        lgd=round(avg_lgd * 100, 2),
         ead=ead_val,
-        ecl=round(float(agg.ecl or 0)),
-        segment=agg.segment or "",
+        ecl=round(float(summary.total_ecl)),
+        segment=summary.segment,
         outstanding=ead_val,
         collateralValue=round(collateral),
         maturity=maturity,
@@ -965,16 +826,30 @@ async def get_loan(
 
 ARTIFACT_FILENAMES: dict[str, str] = {
     OutputArtifactKind.PD_CALCS.value: "PD Calcs.xlsx",
+    OutputArtifactKind.LOAN_DETAIL.value: "ECL Loan Detail.xlsx",
+    OutputArtifactKind.PORTFOLIO_SUMMARY.value: "ECL Portfolio Summary.xlsx",
+    # Runs before engine v1.3.0.
     OutputArtifactKind.LGD.value: "LGD.xlsx",
     OutputArtifactKind.RUNDOWN.value: "Contractual Rundown.xlsx",
     OutputArtifactKind.ECL_SUMMARY.value: "ECL Summary.xlsx",
 }
 
-WORKBOOK_BUNDLE_KINDS: tuple[str, ...] = (
-    OutputArtifactKind.PD_CALCS.value,
-    OutputArtifactKind.LGD.value,
-    OutputArtifactKind.RUNDOWN.value,
-)
+
+async def _get_run_or_404(db: AsyncSession, tenant_id: str, run_id: str):
+    from app.modules.runs.models import Run
+
+    run = (
+        await db.execute(
+            select(Run).where(
+                Run.id == run_id,
+                Run.tenant_id == tenant_id,
+                Run.deleted_at.is_(None),
+            )
+        )
+    ).scalar_one_or_none()
+    if run is None:
+        raise ECLException("RESOURCE_NOT_FOUND", "Run not found.", 404)
+    return run
 
 
 async def _get_output_artifact(
@@ -984,17 +859,8 @@ async def _get_output_artifact(
     kind: str,
 ):
     from app.modules.results.models import OutputArtifact
-    from app.modules.runs.models import Run
 
-    run_result = await db.execute(
-        select(Run.id).where(
-            Run.id == run_id,
-            Run.tenant_id == tenant_id,
-            Run.deleted_at.is_(None),
-        )
-    )
-    if not run_result.scalar_one_or_none():
-        raise ECLException("RESOURCE_NOT_FOUND", "Run not found.", 404)
+    await _get_run_or_404(db, tenant_id, run_id)
 
     result = await db.execute(
         select(OutputArtifact).where(
@@ -1051,12 +917,145 @@ async def build_workbooks_bundle(
     import zipfile
 
     from app.core.storage import download_bytes
+    from app.modules.results.models import OutputArtifact
 
+    await _get_run_or_404(db, tenant_id, run_id)
+    artifacts = (
+        await db.execute(
+            select(OutputArtifact)
+            .where(OutputArtifact.run_id == run_id, OutputArtifact.tenant_id == tenant_id)
+            .order_by(OutputArtifact.created_at)
+        )
+    ).scalars().all()
+    if not artifacts:
+        raise ECLException("ARTIFACT_NOT_FOUND", "This run has no output workbooks.", 404)
     buffer = io.BytesIO()
     with zipfile.ZipFile(buffer, "w", zipfile.ZIP_DEFLATED) as archive:
-        for kind in WORKBOOK_BUNDLE_KINDS:
-            artifact = await _get_output_artifact(db, tenant_id, run_id, kind)
-            content = await download_bytes(artifact.storage_path)
-            archive.writestr(ARTIFACT_FILENAMES[kind], content)
+        for artifact in artifacts:
+            name = ARTIFACT_FILENAMES.get(artifact.kind, f"{artifact.kind}.xlsx")
+            archive.writestr(name, await download_bytes(artifact.storage_path))
 
     return buffer.getvalue(), f"ECL_{run_id}_PD_LGD_EAD_workbooks.zip"
+
+
+async def get_ecl_report(
+    db: AsyncSession,
+    tenant_id: str,
+    run_id: str,
+    *,
+    user: User | None = None,
+    membership: TenantMembership | None = None,
+) -> EclReportOut:
+    """Spec Step 11 portfolio view + 12.1 reconciliation for one completed run."""
+    from app.engine.ecl_pipeline import SPEC_VERSION
+    from app.engine.ecl_rules import STAGES
+    from app.modules.results.models import RunException
+
+    run = await _latest_completed_run(db, tenant_id, run_id, user=user, membership=membership)
+    base = _summary_filter(run.id, tenant_id)
+    totals = (
+        await db.execute(
+            select(
+                func.coalesce(func.sum(EclLoanSummary.outstanding), 0),
+                func.coalesce(func.sum(EclLoanSummary.total_ecl), 0),
+                func.coalesce(func.sum(EclLoanSummary.ecl_before_cap), 0),
+                func.count(),
+                func.count().filter(EclLoanSummary.ecl_capped.is_(True)),
+            ).where(*base)
+        )
+    ).one()
+    outstanding, ecl, before_cap, loans, capped = (
+        float(totals[0]), float(totals[1]), float(totals[2]), int(totals[3]), int(totals[4])
+    )
+
+    async def _group(column) -> dict[str, tuple[float, float]]:
+        rows = await db.execute(
+            select(column, func.sum(EclLoanSummary.outstanding), func.sum(EclLoanSummary.total_ecl))
+            .where(*base)
+            .group_by(column)
+        )
+        return {key: (float(o or 0), float(e or 0)) for key, o, e in rows.all()}
+
+    def _rows(groups: dict[str, tuple[float, float]], keys: list[str]) -> list[SummaryRowOut]:
+        out = [
+            SummaryRowOut(key=k, outstanding=o, ecl=e, coverage=e / o if o else 0.0)
+            for k in keys
+            for o, e in [groups.get(k, (0.0, 0.0))]
+        ]
+        out.append(
+            SummaryRowOut(
+                key="Total", outstanding=outstanding, ecl=ecl,
+                coverage=ecl / outstanding if outstanding else 0.0,
+            )
+        )
+        return out
+
+    stage_groups = await _group(EclLoanSummary.stage)
+    segment_groups = await _group(EclLoanSummary.segment)
+    counts = await db.execute(
+        select(RunException.category, func.count())
+        .where(RunException.run_id == run.id, RunException.tenant_id == tenant_id)
+        .group_by(RunException.category)
+    )
+    recon = [ReconciliationOut(**c) for c in (run.reconciliation or [])]
+    loan_count = next((c for c in recon if c.name == "Loan count"), None)
+    return EclReportOut(
+        runId=run.id,
+        reportingDate=run.reporting_date.isoformat() if run.reporting_date else None,
+        specVersion=SPEC_VERSION,
+        engineVersion=run.engine_version,
+        totals=EclTotalsOut(
+            outstanding=outstanding,
+            ecl=ecl,
+            eclBeforeCap=before_cap,
+            coverage=ecl / outstanding if outstanding else 0.0,
+            loans=loans,
+            excludedRows=int(loan_count.expected) - loans if loan_count else 0,
+            cappedLoans=capped,
+        ),
+        stageSummary=_rows(stage_groups, list(STAGES)),
+        segmentSummary=_rows(segment_groups, sorted(segment_groups)),
+        reconciliation=recon,
+        exceptionCounts={cat: int(n) for cat, n in counts.all()},
+    )
+
+
+async def list_run_exceptions(
+    db: AsyncSession,
+    tenant_id: str,
+    run_id: str,
+    *,
+    category: str | None = None,
+    page: int = 1,
+    per_page: int = 50,
+    user: User | None = None,
+    membership: TenantMembership | None = None,
+) -> ExceptionsPageOut:
+    from app.modules.results.models import RunException
+
+    run = await _latest_completed_run(db, tenant_id, run_id, user=user, membership=membership)
+    where = [RunException.run_id == run.id, RunException.tenant_id == tenant_id]
+    if category:
+        where.append(RunException.category == category)
+    total = (await db.execute(select(func.count()).where(*where))).scalar_one()
+    rows = (
+        await db.execute(
+            select(RunException)
+            .where(*where)
+            .order_by(RunException.seq)
+            .offset((page - 1) * per_page)
+            .limit(per_page)
+        )
+    ).scalars().all()
+    return ExceptionsPageOut(
+        items=[
+            ExceptionOut(
+                category=r.category, dataset=r.dataset, loanId=r.loan_id, customerId=r.customer_id,
+                field=r.field, value=r.value, issue=r.issue, action=r.action,
+            )
+            for r in rows
+        ],
+        total=int(total),
+        page=page,
+        perPage=per_page,
+    )
