@@ -122,6 +122,8 @@ class SegmentBarOut(BaseModel):
 
 class RunDetailOut(RunListItemOut):
     reportingDate: str | None = None
+    # pending | running | complete | error: the Excel downloads are built after the run completes.
+    workbooksStatus: str | None = None
     elapsed: str | None = None
     kpis: list[KpiOut]
     segments: list[SegmentBarOut]

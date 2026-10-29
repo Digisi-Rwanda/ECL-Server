@@ -81,6 +81,14 @@ celery_app.conf.update(
             "soft_time_limit": settings.compute_soft_time_limit,
             "time_limit": settings.compute_hard_time_limit,
         },
+        "workbooks_task": {
+            "soft_time_limit": settings.compute_soft_time_limit,
+            "time_limit": settings.compute_hard_time_limit,
+        },
+        "validation_task": {
+            "soft_time_limit": settings.compute_soft_time_limit,
+            "time_limit": settings.compute_hard_time_limit,
+        },
     },
     **(
         {

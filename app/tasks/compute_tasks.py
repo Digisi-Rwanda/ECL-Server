@@ -14,7 +14,7 @@ from typing import Any
 from uuid import uuid4
 
 import pandas as pd
-from sqlalchemy import select, text, update
+from sqlalchemy import select, text
 from sqlalchemy.ext.asyncio import AsyncSession, async_sessionmaker, create_async_engine
 from sqlalchemy.pool import NullPool
 
@@ -276,10 +276,14 @@ async def _prepare_ecl_inputs(db, run):
         raise ValueError("No EAD uploads found for run")
     if not lgd_uploads:
         raise ValueError("No LGD uploads found for run")
-    exposure = _combine_excel_bytes(await _download_uploads(ead_uploads), keep_sheet=is_exposure_sheet)
-    collateral = _combine_excel_bytes(await _download_uploads(lgd_uploads), keep_sheet=is_collateral_sheet)
+    exposure = await asyncio.to_thread(
+        _combine_excel_bytes, await _download_uploads(ead_uploads), is_exposure_sheet
+    )
+    collateral = await asyncio.to_thread(
+        _combine_excel_bytes, await _download_uploads(lgd_uploads), is_collateral_sheet
+    )
     config = await _load_collateral_config(db, run.tenant_id)
-    prepared = prepare_inputs(exposure, collateral, config, run.reporting_date)
+    prepared = await asyncio.to_thread(prepare_inputs, exposure, collateral, config, run.reporting_date)
     return prepared, ead_uploads, lgd_uploads, config
 
 
@@ -403,13 +407,13 @@ async def _pd_main(run_id: str) -> dict[str, str]:
             _log.info("pd_files_downloaded", run_id=run_id, file_count=len(files), total_bytes=total_bytes, pct=25)
 
             _log.info("pd_combining_sheets", run_id=run_id, pct=30)
-            pd_input = _combine_excel_bytes(files, keep_sheet=is_pd_data_sheet)
+            pd_input = await asyncio.to_thread(_combine_excel_bytes, files, is_pd_data_sheet)
             del files
             gc.collect()
             _log.info("pd_data_combined", run_id=run_id, row_count=len(pd_input), columns=list(pd_input.columns), pct=35)
 
             _log.info("pd_computing_transition_matrices", run_id=run_id, pct=40)
-            pd_output, _cure_rates, _intermediates = compute_pd(pd_input)
+            pd_output, _cure_rates, _intermediates = await asyncio.to_thread(compute_pd, pd_input)
             from app.modules.results.pd_observation import persist_pd_observation
 
             preview = _intermediates.get("preview")
@@ -455,7 +459,7 @@ async def _pd_main(run_id: str) -> dict[str, str]:
 
 async def _lgd_main(run_id: str) -> dict[str, str]:
     """LGD stage — runs in the calling event loop."""
-    from app.core.run_enums import RunStatus, UploadKind
+    from app.core.run_enums import RunStatus
     from app.engine.bulk_insert import bulk_insert_lgd_results
     from app.engine.lgd_engine import compute_lgd
 
@@ -482,7 +486,7 @@ async def _lgd_main(run_id: str) -> dict[str, str]:
                 configured_types=[c["name"] for c in collateral_config],
                 pct=40,
             )
-            lgd_output = compute_lgd(prepared)
+            lgd_output = await asyncio.to_thread(compute_lgd, prepared)
             _log.info("lgd_computed", run_id=run_id, output_rows=len(lgd_output), pct=80)
 
             _log.info("lgd_inserting_results", run_id=run_id, rows=len(lgd_output), pct=85)
@@ -510,16 +514,37 @@ async def _lgd_main(run_id: str) -> dict[str, str]:
             raise
 
 
-async def _ead_ecl_main(run_id: str) -> dict[str, str]:
-    """EAD + ECL stage: spec Steps 2-11 and the 12.1 reconciliation."""
-    from app.core.run_enums import OutputArtifactKind, RunStatus, UploadKind
-    from app.engine import ENGINE_VERSION
-    from app.engine.bulk_insert import (
-        bulk_insert_ead_results,
-        bulk_insert_exceptions,
-        bulk_insert_loan_summaries,
-    )
+async def _compute_ecl(db, run) -> dict[str, Any]:
+    """Inputs + exact PD curve + the full spec pipeline, heavy parts in threads.
+
+    Deterministic, so the workbook job can rebuild exactly what the ECL stage
+    stored instead of passing large objects between processes.
+    """
+    from app.core.run_enums import UploadKind
     from app.engine.ecl_pipeline import run_ecl
+    from app.engine.pd_engine import compute_pd, is_pd_data_sheet
+
+    prepared, ead_uploads, lgd_uploads, collateral_config = await _prepare_ecl_inputs(db, run)
+    # Recompute the PD curve from the PD files rather than reading pd_results,
+    # which are rounded to 8 decimals: the exact curve validation previewed.
+    pd_uploads = await _load_uploads(db, run.id, UploadKind.PD.value)
+    pd_files = await _download_uploads(pd_uploads)
+    if not run.combine_pd_files and len(pd_files) > 1:
+        pd_files = pd_files[:1]
+    pd_input = await asyncio.to_thread(_combine_excel_bytes, pd_files, is_pd_data_sheet)
+    pd_output, cure_rates, intermediates = await asyncio.to_thread(compute_pd, pd_input)
+    ecl = await asyncio.to_thread(run_ecl, prepared, pd_output)
+    return {
+        "prepared": prepared, "ecl": ecl, "pd_output": pd_output, "cure_rates": cure_rates,
+        "intermediates": intermediates, "ead_uploads": ead_uploads, "lgd_uploads": lgd_uploads,
+        "pd_uploads": pd_uploads, "collateral_config": collateral_config,
+    }
+
+
+async def _workbooks_main(run_id: str) -> dict[str, str]:
+    """Build and store the PD Calcs, Loan Detail and Portfolio workbooks for a complete run."""
+    from app.core.run_enums import OutputArtifactKind, RunStatus
+    from app.engine import ENGINE_VERSION
     from app.engine.ecl_workbooks import (
         LOAN_DETAIL_FILENAME,
         PORTFOLIO_FILENAME,
@@ -527,7 +552,89 @@ async def _ead_ecl_main(run_id: str) -> dict[str, str]:
         build_portfolio_workbook,
     )
     from app.engine.excel_writer import _build_pd_calcs_workbook
-    from app.engine.pd_engine import compute_pd, is_pd_data_sheet
+    from app.modules.auth.models import User
+    from app.modules.results.models import OutputArtifact
+
+    async with _fresh_session() as (db, _engine):
+        run = await _load_run(db, run_id)
+        if run.status != RunStatus.COMPLETE.value:
+            _log.info("workbooks_skipped_run_not_complete", run_id=run_id, status=run.status)
+            return {"run_id": run_id, "stage": "workbooks", "skipped": True}
+        started = _iso_now()
+        await _atomic_stage_update(db, run.id, "workbooks", {"status": "running", "started_at": started})
+        try:
+            inputs = await _compute_ecl(db, run)
+            ecl, prepared = inputs["ecl"], inputs["prepared"]
+            run_by = await db.scalar(select(User.email).where(User.id == run.created_by_user_id))
+            engine_version = run.engine_version or ENGINE_VERSION
+
+            def _input(dataset: str, uploads, rows: int) -> dict[str, Any]:
+                return {
+                    "dataset": dataset,
+                    "file": ", ".join(u.original_filename for u in uploads),
+                    "modified": max(u.created_at for u in uploads).strftime("%Y-%m-%d %H:%M UTC"),
+                    "rows": rows,
+                }
+
+            finished = run.finished_at.isoformat() if run.finished_at else started
+            meta = {
+                "run_at": finished,
+                "run_by": run_by or run.created_by_user_id,
+                "run_id": run.id,
+                "engine_version": engine_version,
+                "inputs": [
+                    _input("Exposure Dataset (EAD)", inputs["ead_uploads"], prepared.exposure_rows_in),
+                    _input("Collateral Dataset (LGD)", inputs["lgd_uploads"],
+                           sum(u.row_count or 0 for u in inputs["lgd_uploads"])),
+                    {"dataset": "Collateral Parameters", "file": "Workspace collateral types",
+                     "modified": "current settings", "rows": len(inputs["collateral_config"])},
+                    _input("PD Dataset (from PD files)", inputs["pd_uploads"], len(inputs["pd_output"])),
+                ],
+            }
+            run_meta = {
+                "run_id": run.id, "tenant_id": run.tenant_id, "timestamp_utc": finished,
+                "engine_version": engine_version, "input_hashes": await _input_hashes(db, run_id),
+            }
+            pd_data = {"pd_df": inputs["pd_output"], "cure_rates": inputs["cure_rates"],
+                       "intermediates": inputs["intermediates"]}
+            workbooks = {
+                "PD Calcs.xlsx": await asyncio.to_thread(_build_pd_calcs_workbook, run_meta, pd_data),
+                LOAN_DETAIL_FILENAME: await asyncio.to_thread(build_loan_detail_workbook, ecl, meta),
+                PORTFOLIO_FILENAME: await asyncio.to_thread(build_portfolio_workbook, ecl, meta),
+            }
+            del inputs, ecl
+            gc.collect()
+            await db.execute(
+                OutputArtifact.__table__.delete().where(OutputArtifact.run_id == run.id)
+            )
+            await _upload_workbooks(db, run, workbooks, {
+                "PD Calcs.xlsx": OutputArtifactKind.PD_CALCS.value,
+                LOAN_DETAIL_FILENAME: OutputArtifactKind.LOAN_DETAIL.value,
+                PORTFOLIO_FILENAME: OutputArtifactKind.PORTFOLIO_SUMMARY.value,
+            })
+            await _atomic_stage_update(
+                db, run.id, "workbooks", {"status": "complete", "started_at": started, "finished_at": _iso_now()}
+            )
+            _log.info("workbooks_uploaded", run_id=run_id, sizes={k: len(v) for k, v in workbooks.items()})
+            return {"run_id": run_id, "stage": "workbooks"}
+        except Exception as exc:
+            # The run's results stand; only the downloads are missing.
+            _log.error("workbooks_failed", run_id=run_id, exc_info=exc)
+            await _atomic_stage_update(
+                db, run.id, "workbooks",
+                {"status": "error", "started_at": started, "finished_at": _iso_now(), "message": str(exc)[:300]},
+            )
+            raise
+
+
+async def _ead_ecl_main(run_id: str) -> dict[str, str]:
+    """EAD + ECL stage: spec Steps 2-11 and the 12.1 reconciliation."""
+    from app.core.run_enums import RunStatus
+    from app.engine.bulk_insert import (
+        bulk_insert_ead_results,
+        bulk_insert_exceptions,
+        bulk_insert_loan_summaries,
+    )
 
     async with _fresh_session() as (db, task_engine):
         run = await _load_run(db, run_id)
@@ -540,27 +647,8 @@ async def _ead_ecl_main(run_id: str) -> dict[str, str]:
 
         try:
             _log.info("ead_loading_inputs", run_id=run_id, pct=5)
-            prepared, ead_uploads, lgd_uploads, collateral_config = await _prepare_ecl_inputs(db, run)
-            # Recompute the PD curve from the PD files rather than reading pd_results,
-            # which are rounded to 8 decimals: the exact curve validation previewed.
-            pd_uploads = await _load_uploads(db, run_id, UploadKind.PD.value)
-            pd_files = await _download_uploads(pd_uploads)
-            if not run.combine_pd_files and len(pd_files) > 1:
-                pd_files = pd_files[:1]
-            pd_input = _combine_excel_bytes(pd_files, keep_sheet=is_pd_data_sheet)
-            pd_output, cure_rates, intermediates = compute_pd(pd_input)
-            pd_df = pd_output
-            _log.info(
-                "ead_inputs_prepared",
-                run_id=run_id,
-                loans=len(prepared.exposure),
-                excluded=len(prepared.excluded),
-                reporting_date=str(prepared.reporting_date),
-                pd_rows=len(pd_df),
-                pct=20,
-            )
-
-            ecl = run_ecl(prepared, pd_df)
+            inputs = await _compute_ecl(db, run)
+            prepared, ecl = inputs["prepared"], inputs["ecl"]
             _log.info(
                 "ead_rows_computed",
                 run_id=run_id,
@@ -594,60 +682,6 @@ async def _ead_ecl_main(run_id: str) -> dict[str, str]:
                 for e in ecl.exceptions[:50]
             ]
 
-            from app.modules.auth.models import User
-
-            run_by = await db.scalar(select(User.email).where(User.id == run.created_by_user_id))
-            timestamp_utc = _iso_now()
-            engine_version = run.engine_version or ENGINE_VERSION
-
-            def _input(dataset: str, uploads, rows: int) -> dict[str, Any]:
-                return {
-                    "dataset": dataset,
-                    "file": ", ".join(u.original_filename for u in uploads),
-                    "modified": max(u.created_at for u in uploads).strftime("%Y-%m-%d %H:%M UTC"),
-                    "rows": rows,
-                }
-
-            meta = {
-                "run_at": timestamp_utc,
-                "run_by": run_by or run.created_by_user_id,
-                "run_id": run.id,
-                "engine_version": engine_version,
-                "inputs": [
-                    _input("Exposure Dataset (EAD)", ead_uploads, prepared.exposure_rows_in),
-                    _input("Collateral Dataset (LGD)", lgd_uploads, sum(u.row_count or 0 for u in lgd_uploads)),
-                    {
-                        "dataset": "Collateral Parameters",
-                        "file": "Workspace collateral types",
-                        "modified": "current settings",
-                        "rows": len(collateral_config),
-                    },
-                    _input("PD Dataset (from PD files)", pd_uploads, len(pd_df)),
-                ],
-            }
-            run_meta = {
-                "run_id": run.id,
-                "tenant_id": run.tenant_id,
-                "timestamp_utc": timestamp_utc,
-                "engine_version": engine_version,
-                "input_hashes": await _input_hashes(db, run_id),
-            }
-            workbooks = {
-                "PD Calcs.xlsx": _build_pd_calcs_workbook(
-                    run_meta, {"pd_df": pd_output, "cure_rates": cure_rates, "intermediates": intermediates}
-                ),
-                LOAN_DETAIL_FILENAME: build_loan_detail_workbook(ecl, meta),
-                PORTFOLIO_FILENAME: build_portfolio_workbook(ecl, meta),
-            }
-            artifact_kinds = {
-                "PD Calcs.xlsx": OutputArtifactKind.PD_CALCS.value,
-                LOAN_DETAIL_FILENAME: OutputArtifactKind.LOAN_DETAIL.value,
-                PORTFOLIO_FILENAME: OutputArtifactKind.PORTFOLIO_SUMMARY.value,
-            }
-            _log.info("ecl_workbooks_generated", run_id=run_id, sizes={k: len(v) for k, v in workbooks.items()}, pct=90)
-            await _upload_workbooks(db, run, workbooks, artifact_kinds)
-            _log.info("ecl_workbooks_uploaded", run_id=run_id, pct=96)
-
             run.reporting_date = prepared.reporting_date.date() if prepared.reporting_date is not None else None
             run.reconciliation = [
                 {
@@ -662,7 +696,7 @@ async def _ead_ecl_main(run_id: str) -> dict[str, str]:
             ]
             await db.commit()
 
-            del pd_input, pd_output, workbooks, ecl
+            del inputs, ecl
             gc.collect()
 
             ead_progress = await _mark_stage_complete(db, run.id, "ead", started_at)
@@ -728,6 +762,10 @@ async def _ead_ecl_main(run_id: str) -> dict[str, str]:
                     tenant_id=run.tenant_id,
                     details={"run_id": run.id},
                 )
+            # Excel files can take minutes for big books; build them after the run
+            # is complete so results are usable at once.
+            if not _INLINE_COMPUTE.get():
+                workbooks_task.delay(run_id)
             return {"run_id": run_id, "stage": "ead_ecl"}
         except Exception as exc:
             _log.error("compute_stage_failed", run_id=run_id, stage=active_stage, exc_info=exc)
@@ -791,6 +829,34 @@ def ead_ecl_task(self, run_id: str) -> dict[str, str]:  # type: ignore[misc]
         raise
 
 
+@celery_app.task(name="workbooks_task", bind=True)
+def workbooks_task(self, run_id: str) -> dict[str, str]:  # type: ignore[misc]
+    _log.info("task_received", run_id=run_id, stage="workbooks")
+
+    async def _with_prepare():
+        await _prepare_task()
+        return await _workbooks_main(run_id)
+
+    return _run(_with_prepare())
+
+
+@celery_app.task(name="validation_task", bind=True)
+def validation_task(  # type: ignore[misc]
+    self, job_id: str, tenant_id: str, run_id: str, user_id: str, scope: str,
+    ip: str | None = None, user_agent: str | None = None,
+) -> None:
+    from app.modules.runs.validation_jobs import run_job_isolated
+
+    _log.info("task_received", run_id=run_id, stage=f"validate:{scope}", job_id=job_id)
+
+    async def _go() -> None:
+        await _prepare_task()
+        await run_job_isolated(job_id=job_id, tenant_id=tenant_id, run_id=run_id,
+                               user_id=user_id, scope=scope, ip=ip, user_agent=user_agent)
+
+    _run(_go())
+
+
 # ---------------------------------------------------------------------------
 # Inline pipeline — runs in FastAPI's event loop (no worker needed)
 # ---------------------------------------------------------------------------
@@ -840,6 +906,10 @@ async def run_compute_pipeline_async(run_id: str) -> None:
             return
         await _ead_ecl_main(run_id)
         _log.info("compute_pipeline_inline_finished", run_id=run_id)
+        try:
+            await _workbooks_main(run_id)
+        except Exception:
+            pass  # logged inside; the run itself is complete
     except Exception as exc:
         _log.error("compute_pipeline_unhandled_error", run_id=run_id, exc_info=exc)
     finally:

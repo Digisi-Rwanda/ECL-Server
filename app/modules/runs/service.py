@@ -992,6 +992,7 @@ async def get_run(
         return RunDetailOut(
             **base.model_dump(),
             reportingDate=run.reporting_date.isoformat() if run.reporting_date else None,
+            workbooksStatus=((run.engine_progress or {}).get("workbooks") or {}).get("status"),
             elapsed=_format_elapsed(run.started_at, run.finished_at),
             kpis=_build_kpis(run, None),
             segments=[],
@@ -1025,6 +1026,7 @@ async def get_run(
     return RunDetailOut(
         **base.model_dump(),
         reportingDate=run.reporting_date.isoformat() if run.reporting_date else None,
+        workbooksStatus=((run.engine_progress or {}).get("workbooks") or {}).get("status"),
         elapsed=_format_elapsed(run.started_at, run.finished_at),
         kpis=_build_kpis(run, loan_count),
         segments=await _segment_bars(db, run_id, tenant_id)
